@@ -1,0 +1,18 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  width="24"
+  height="24"
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="2.75"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+>
+  <!-- The ring: a circle (center 12,12 radius 8) with a 60 degree gap left
+       open at the top for the "focused column" break, per style guide §8. -->
+  <path d="M16 5.072A8 8 0 1 1 8 5.072" />
+  <!-- The dot marking the break, filled (not stroked) so it reads as a solid
+       point rather than a small ring of its own. -->
+  <circle cx="12" cy="4" r="1.3" fill="currentColor" stroke="none" />
+</svg>

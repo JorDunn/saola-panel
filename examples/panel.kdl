@@ -1,0 +1,94 @@
+// saola-panel configuration — panel.kdl
+//
+// This is documentation, not the live config: the panel never reads this
+// file. Copy whichever parts you want into your own config at
+// $XDG_CONFIG_HOME/saola/panel.kdl (usually ~/.config/saola/panel.kdl) —
+// the panel reads that path once, at boot, and needs a restart to notice a
+// change (there is no live-reload).
+//
+// Every knob below is optional. If a knob (or the whole file) is missing,
+// the panel falls back to exactly the values shown here — this example
+// *is* the built-in default, written out for reference, not a
+// recommendation to override everything. If the file fails to parse at
+// all, the panel prints one warning to stderr and starts with these same
+// defaults rather than refusing to run: a status bar must never fail to
+// start over a config typo. A single bad knob (an unrecognized `style`, an
+// `ink` that isn't a real hex color, an unknown module name in a list)
+// only resets *that* knob to its default and prints its own warning — it
+// does not throw away the rest of the file.
+panel {
+    // The two layouts the Saola design system defines. "ledger" is one
+    // floating ink pill spanning the screen (the default, and what you're
+    // reading the settings for). "islands" splits it into three separate
+    // translucent pill clusters — one per region below — each its own
+    // layer-shell surface, with the wallpaper showing through between
+    // them. The design system's own default is "islands"; this file keeps
+    // "ledger" only because that is what the panel defaults to.
+    style "ledger" // or "islands"
+
+    // Which screen edge the bar anchors to. This replaced the old
+    // `--bottom` command-line flag — there is no flag anymore, only this.
+    edge "top" // or "bottom"
+
+    // Ledger content margin, in logical pixels — the padding between the
+    // bar's own edges and the leftmost/rightmost modules. Islands mode
+    // uses a different default margin (26, vs. ledger's 20) since island
+    // pills float inward from the screen edge rather than touching it;
+    // this knob overrides either style's default with one explicit
+    // number if you set it.
+    margin 20
+
+    // The bar's height, in logical pixels — and, with it, the compositor
+    // exclusive zone reserved along the anchored edge so tiled windows
+    // don't sit underneath the panel (the compositor adds the margin above
+    // to that zone itself, so ledger reserves 48 + 18 = 66 px). In islands
+    // mode this knob sets each island pill's height instead, and its
+    // default is the shorter island pill (40) rather than the bar's 48 —
+    // the reserved strip works out to the same 66 px either way. So if you
+    // switch to islands, delete this line (or set it to 40) rather than
+    // leaving the ledger's 48 behind.
+    height 48
+
+    // The three regions, left to right (or, in islands mode, the three
+    // separate island surfaces). Each is a list of module names in
+    // display order — reorder, add, or remove freely. Recognized names
+    // this release: mark, mpris, clock, niri-columns, volume, network,
+    // battery, claude, tray. An unknown name (e.g. a typo, or
+    // "notifications" — excluded from the panel entirely, see below) is
+    // skipped with a warning; the rest of the list still loads.
+    left   { mark; mpris }
+    center { clock; niri-columns }
+    right  { volume; network; battery; claude }
+
+    // `tray` is recognized (it won't warn if you list it) but does not
+    // render anything yet — the system tray module ships in a later
+    // stage. Listing it now is forward-compatible: nothing to change
+    // later.
+    //
+    // "notifications" appears in the Saola design system's own panel
+    // sketch but is deliberately out of scope for this panel entirely (a
+    // separate saola-notifications component owns it) — listing it here
+    // will warn and be skipped, not silently do nothing.
+
+    // Where the bar's mark glyph (the small logo in the left region, next
+    // to whatever "mark" resolves to in the module lists above) comes
+    // from:
+    //   "builtin:horns"          - the default Saola mark (shown here)
+    //   "builtin:notch"          - the alternative built-in mark
+    //   "file:~/.icons/arch.svg" - your own SVG; `~` expands to $HOME
+    //   "none"                   - no mark glyph at all
+    mark "builtin:horns"
+
+    // Overrides for the three identity colors (ink = every shell surface,
+    // paper = a control at rest, accent = on/selected/live). Each is
+    // independently optional — set only the ones you want to change.
+    // Values are "#RRGGBB" or "#RRGGBBAA" hex strings; anything else logs
+    // a warning and that one color keeps its built-in value. These are
+    // shown here at the Saola defaults, so uncommenting this block
+    // unchanged would have no visible effect.
+    colors {
+        ink "#0C0A00"
+        paper "#FFFFF0"
+        accent "#C67139"
+    }
+}

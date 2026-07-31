@@ -1,0 +1,128 @@
+[package]
+name = "saola-panel"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# `tag` and `version` must move together: `version` names the crate version
+# inside the tagged checkout, and cargo errors loudly if they disagree — which
+# is exactly the point, since a tag bump that forgets one of them is a bug.
+#
+# Bumped v0.1.0 → v0.2.0 at Stage 11, deliberately (CLAUDE.md requires a tag
+# bump be a reviewed change, never a drift to `branch = "main"`). The panel's
+# niri minimap needs `style::container::dash` + its `DashState`, and the
+# `sizes.dash_*` geometry tokens behind it — all new in the v0.2.0 release.
+#
+# Bumped v0.2.0 → v0.3.0 at Stage 14.5 (the concept-alignment pass), equally
+# deliberately: the floating ledger bar needs `style::container::bar_pill` +
+# `sizes.panel_margin_ledger_top`, the weighted fonts (`ui_font` at the
+# guide's mandatory 500, `ui_font_regular` for the media title), the compact
+# in-bar pill heights (`panel_pill_media`/`panel_pill_clock`), the three
+# `bar_*_gap` tokens, and `media_title_max_width` — all new in v0.3.0. This
+# bump also retired the temporary `[patch]` that briefly pointed at the local
+# saola-theme working tree while v0.3.0 was still unreleased.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.3.0", version = "0.3.0" }
+iced_layershell = "0.19"
+# `svg` pulls in `resvg` (via `iced_tiny_skia`) for rasterizing the Lucide
+# icon assets embedded in `src/icons.rs` — see that module for the tinting
+# mechanics (`svg::Style { color }` recolors at draw time, so the SVGs'
+# own stroke color is never what actually appears on screen).
+#
+# `image` is Stage 19's addition: a real tray icon resolved through the
+# freedesktop icon-theme lookup (see `freedesktop-icons` below) can be
+# raster (PNG) as easily as vector, and `IconPixmap` — the SNI protocol's
+# embedded-bitmap fallback — is *always* raster (decoded ARGB32 pixel data,
+# never SVG). `iced_tiny_skia`'s `image` feature pulls in the `image` crate
+# for raster decoding, the same way `svg` pulls in `resvg` for vector.
+iced = { version = "0.14", features = ["tokio", "svg", "image"] }
+chrono = "0.4"
+# D-Bus. `default-features = false` drops zbus's default `async-io` runtime;
+# the `tokio` feature makes it spawn its internal tasks on the tokio runtime
+# that iced's own `tokio` feature (above) already provides — one runtime,
+# never two, and no blocking API anywhere near the UI thread.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# Audio. The PulseAudio *client* API, which PipeWire serves via
+# `pipewire-pulse` — chosen over native pipewire-rs (SPA-pod parsing) per
+# PLAN.md Stage 10. Links against the system `libpulse.so`, so a build host
+# needs libpulse's headers/pkg-config. Default features (`pa_v6`/`pa_v8`) are
+# left as-is deliberately: they set the *minimum* client-library version the
+# crate will accept at runtime, and nothing this panel calls (subscribe,
+# sink/server introspection) needs a newer API — raising them would only shrink
+# the set of machines the binary runs on. See `src/modules/volume.rs` for the
+# thread-bridge pattern this dependency is wrapped in.
+libpulse-binding = "2.30.1"
+# niri IPC. `niri-ipc` is the serde type set vendored out of the niri repo
+# itself, so `Event`/`Request`/`Window` here are *the* wire format rather than
+# a hand-written guess at it. Pinned to 26.4, which matches the installed
+# compositor (`niri msg --json version` → 26.04); niri versions its IPC crate
+# in lockstep with the compositor, and fields do move between releases (see
+# `src/modules/columns.rs` for which ones this panel actually reads). Default
+# features only — the optional `clap`/`json-schema` features are for niri's
+# own CLI and are not wanted here.
+# The `=` is not paranoia: niri-ipc's own docs state it follows the niri
+# version and is *not* Rust-semver-stable — new struct fields and enum
+# variants land in patch bumps — and tell consumers to use an exact
+# requirement. A niri upgrade is therefore a deliberate bump of this line,
+# same posture as the saola-theme tag above.
+niri-ipc = "=26.4.0"
+# The JSON-lines codec for the socket above: one `Event` per line. niri-ipc
+# derives serde impls but deliberately does no I/O of its own beyond a
+# *blocking* helper we can't use, so the panel owns the (de)serialization.
+serde_json = "1"
+# Async Unix-socket I/O for the niri worker.
+#
+# Teaching note (why a direct tokio dependency is *not* a second runtime):
+# handoff 4's "no direct tokio" note guarded against pulling in a second
+# executor alongside the one iced already spins up. This is the opposite: no
+# `#[tokio::main]`, no `Runtime::new()`, no `block_on` anywhere in this crate.
+# We only ask for the *feature flags* that switch on the socket and timer
+# APIs of the single runtime iced's own `tokio` feature already created — the
+# same runtime zbus (above) hands its tasks to. iced constructs it via
+# `tokio::runtime::Runtime::new()`, i.e. multi-thread with `enable_all()`, so
+# its I/O and time drivers are live and a `UnixStream`/`sleep` created inside
+# a subscription's future finds a reactor. Cargo unifies features across the
+# dependency graph, so these flags land on that one runtime rather than
+# building a private copy.
+tokio = { version = "1", features = ["net", "io-util", "time"] }
+# `panel.kdl` (Stage 14). `kdl` is the reference Rust implementation of the
+# KDL document language the style guide's `panel { }` config sketch uses.
+# `src/config.rs` walks the parsed document by hand (`get_arg`, `children`,
+# …) rather than deriving a `serde`-style deserializer — see that module's
+# doc comment for why (precise per-knob warnings, and explicit code reads
+# better for CLAUDE.md's teaching-note rule). Default features only (`span`
+# for diagnostics-friendly parse errors, `serde` unused here since we don't
+# deserialize `PanelConfig` itself through `kdl`'s serde support).
+kdl = "6.7.1"
+# Stage 19: resolves a tray item's `IconName` (e.g. `"slack"`) to a real
+# icon file via the freedesktop icon-theme spec — the same lookup GTK/Qt
+# apps use to find their own icons on disk (theme directories under
+# `~/.local/share/icons`, `/usr/share/icons`, `index.theme` inheritance,
+# …). `src/modules/tray/item.rs` is the only caller; see its module doc
+# comment for the full icon-source precedence (this lookup first, the
+# item's own `IconPixmap` as the fallback) and why the lookup runs inside
+# `tokio::task::spawn_blocking` rather than inline on the tray worker's
+# async task (it's synchronous filesystem I/O). Default features only —
+# `local_tests` gates the crate's own tests against the *build host's*
+# installed icon themes, which this panel doesn't want to depend on.
+freedesktop-icons = "0.4.0"
+# Stage 20: `#[derive(Serialize, Deserialize)]` on the `com.canonical.dbusmenu`
+# wire type in `src/modules/tray/menu.rs`. serde was already in the tree
+# (`serde_json`, `kdl` and `niri-ipc` all pull it in, and zbus is built on it),
+# but a derive macro can only be *named* by a direct dependency — the
+# alternative is `#[serde(crate = "zbus::zvariant::export::serde")]` on every
+# type, which is noise. No new code lands in the binary from this line.
+serde = { version = "1", features = ["derive"] }
+
+# TEMPORARY — retire this at the next saola-theme tag bump, exactly as the
+# Stage 14.5 patch described above was retired when v0.3.0 shipped.
+#
+# The islands clock fix needs the theme's unreleased column-strip change (the
+# focused dash becomes the solid ivory element, so the centre island has one
+# solid ivory element and it isn't the clock). Until that lands in a release,
+# the panel builds against the local saola-theme working tree. The `tag` /
+# `version` pair on the dependency line above is deliberately left alone: a
+# `[patch]` overrides the *source*, not the requirement, so the released pin
+# stays recorded and the bump stays a reviewed, single-line change.
+[patch."https://github.com/JorDunn/saola-theme"]
+saola-theme = { path = "../saola-theme/crates/saola-theme" }
