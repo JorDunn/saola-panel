@@ -708,8 +708,30 @@ impl PanelConfig {
     }
 }
 
+/// The `--help` text, kept next to [`CliOverrides::parse`] so the two lists
+/// of flags can't drift apart without the mismatch staring the editor in the
+/// face (and a test cross-checks them). `main` prints this and exits before
+/// any config is read or any Wayland connection is attempted.
+pub const HELP: &str = "\
+saola-panel — status bar for the Saola desktop environment
+
+Usage: saola-panel [FLAGS]
+
+Flags override the matching knobs in panel.kdl; anything not flagged
+comes from the file (or the built-in default when there is no file).
+
+  --ledger             ledger layout: one full-width bar
+  --islands            islands layout: floating ink pill clusters
+  --top                anchor the panel to the top edge of the screen
+  --bottom             anchor the panel to the bottom edge
+  --config-dir <dir>   read panel.kdl from <dir> instead of the
+                       $SAOLA_CONFIG_DIR / XDG search path
+                       (also spelled --config-dir=<dir>)
+  -h, --help           print this help and exit
+";
+
 /// Command-line overrides for quick testing: `--ledger`, `--islands`,
-/// `--top`, `--bottom`, `--config-dir <dir>`. A flag beats the
+/// `--top`, `--bottom`, `--config-dir <dir>`, plus `--help`. A flag beats the
 /// corresponding `panel.kdl` knob, which beats the built-in default — so
 /// `cargo run -- --islands` tries the Islands layout without editing (or
 /// even having) a config file, and the next plain `cargo run` is back to
@@ -740,6 +762,11 @@ pub struct CliOverrides {
     /// callers clone instead, which is just as cheap for a value this
     /// small and this rarely passed around.
     pub config_dir: Option<PathBuf>,
+    /// `--help` (or `-h`): the user asked for the flag reference. Only
+    /// *recorded* here — `parse` never prints [`HELP`] or exits itself,
+    /// because it also runs in tests; `main` checks this field first thing
+    /// and prints-and-returns before any config load or Wayland setup.
+    pub help: bool,
 }
 
 impl CliOverrides {
@@ -806,6 +833,7 @@ impl CliOverrides {
                 "--top" => overrides.edge = Some(Edge::Top),
                 "--bottom" => overrides.edge = Some(Edge::Bottom),
                 "--config-dir" => awaiting_dir = true,
+                "--help" | "-h" => overrides.help = true,
                 other => {
                     if let Some(dir) = other.strip_prefix("--config-dir=") {
                         if dir.is_empty() {
@@ -1501,6 +1529,36 @@ mod tests {
             CliOverrides::parse(std::iter::empty::<&str>()),
             CliOverrides::default()
         );
+    }
+
+    /// Both spellings of the help flag set `help`, alongside (not instead
+    /// of) whatever other flags were given — `main` decides that help
+    /// short-circuits everything else, not the parser.
+    #[test]
+    fn cli_help_flag_parses_in_both_spellings() {
+        assert!(CliOverrides::parse(["--help"]).help);
+        assert!(CliOverrides::parse(["-h"]).help);
+        assert!(!CliOverrides::parse(["--islands"]).help);
+        let mixed = CliOverrides::parse(["--islands", "--help"]);
+        assert!(mixed.help);
+        assert_eq!(mixed.style, Some(PanelStyle::Islands));
+    }
+
+    /// Every flag `parse` recognizes appears in the `--help` text — the
+    /// guard that keeps [`HELP`] honest when a flag is added or renamed.
+    #[test]
+    fn help_text_names_every_recognized_flag() {
+        for flag in [
+            "--ledger",
+            "--islands",
+            "--top",
+            "--bottom",
+            "--config-dir",
+            "--help",
+            "-h",
+        ] {
+            assert!(HELP.contains(flag), "HELP is missing {flag}");
+        }
     }
 
     /// Contradictory flags don't error — the last one wins, like shadowing

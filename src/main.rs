@@ -171,6 +171,15 @@ fn main() -> iced_layershell::Result {
     // parsed *before* the load, unlike the style/edge overrides applied
     // after it: this flag decides where the config is, not what's in it.
     let cli = config::CliOverrides::parse(std::env::args().skip(1));
+
+    // `--help` wins over everything: print the flag reference and exit
+    // before any config is read or any Wayland connection is attempted, so
+    // it works outside a Wayland session too (e.g. over SSH).
+    if cli.help {
+        print!("{}", config::HELP);
+        return Ok(());
+    }
+
     let config_path = config::PanelConfig::resolve_path(cli.config_dir.as_deref());
     let mut config = config::PanelConfig::load(config_path.as_deref());
     cli.apply(&mut config);
