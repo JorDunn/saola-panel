@@ -11,18 +11,32 @@
 # "no signal yet" as its normal quiet state rather than an error).
 #
 # Usage (from a Claude Code hook command):
-#   emit.sh idle        # SessionStart   — session open, nothing happening yet
-#   emit.sh working     # UserPromptSubmit
-#   emit.sh subagent    # PreToolUse, matcher "Task"  — a subagent is spawning
-#   emit.sh working     # SubagentStop   — a subagent finished, main loop
-#                       #                  resumes generating (see note below)
-#   emit.sh done        # Stop            — turn finished, output awaiting review
-#   emit.sh attention   # Notification
-#   emit.sh ended       # SessionEnd
+#   emit.sh idle           # SessionStart    — session open, nothing happening yet
+#   emit.sh working        # UserPromptSubmit
+#   emit.sh subagent       # SubagentStart   — a subagent is spawning
+#   emit.sh subagent-done  # SubagentStop    — a subagent finished (see note below)
+#   emit.sh done           # Stop            — turn finished, output awaiting review
+#   emit.sh attention      # StopFailure     — turn ended in failure, wants eyes
+#   emit.sh attention      # Notification
+#   emit.sh ended          # SessionEnd
 #
-# Six statuses on the wire now, one per session-status semaphore dot (see
-# saola-theme's SAOLA-STYLE-GUIDE.md, "Session status semaphore"):
-#   working | subagent | attention | done | idle | ended
+# Seven statuses on the wire now, though only six are session-status
+# semaphore dots (see saola-theme's SAOLA-STYLE-GUIDE.md, "Session status
+# semaphore"):
+#   working | subagent | subagent-done | attention | done | idle | ended
+#
+# `subagent-done` is NOT its own dot. The panel folds it conditionally: if
+# the session is currently showing the `subagent` dot, it flips back to
+# `working`; otherwise it's a no-op. That conditional fold is the fix for
+# the sticking bug this schema used to have — a background subagent can
+# outlive the turn that spawned it. Under the old two-status wiring
+# (`SubagentStop -> working`, unconditional), the sequence "main loop
+# finishes and Stop fires `done`, then minutes later the straggler
+# subagent's SubagentStop fires `working`" left the dot stuck on `working`
+# with no later writer around to correct it — the turn was already over, so
+# nothing was coming to flip it back to `done`. Folding `subagent-done`
+# only onto an existing `subagent` dot means a post-turn straggler has
+# nothing to flip and is silently dropped instead of clobbering `done`.
 #
 # `idle` and `done` used to be the same status (the old 4-status schema had
 # no "session just started, nothing happened yet" state distinct from
@@ -30,15 +44,15 @@
 # `idle`, Stop emits `done`. If you're updating an old hooks config from
 # before this split, its Stop -> `idle` wiring needs to become Stop -> `done`.
 #
-# SubagentStop -> working, note: this is imperfect with parallel subagents.
-# `SubagentStop` fires per subagent, so if Claude has three `Task` calls in
-# flight and the first one finishes, its hook flips the dot back to
-# `working` even though two subagents are still running underneath — there
-# is no "N of M subagents done" signal to emit instead. The dot only goes
-# back to `subagent` if another `PreToolUse`/`Task` call starts before the
-# main loop's own `Stop` fires. Accepted as close enough: the dot is still
-# accurate about "is the session doing something right now," just not
-# about exactly what.
+# SubagentStop -> subagent-done, note: this replaces the old, imprecise
+# `SubagentStop -> working` wiring. With `subagent-done` folded onto the
+# `subagent` dot conditionally (see above), the dot only ever moves
+# subagent -> working, and a `SubagentStop` that fires after the turn has
+# already ended (Stop already ran, or several parallel subagents finishing
+# one at a time) is a no-op rather than a stray write. Backwards compat:
+# the panel still accepts the old bare `working` status from an un-updated
+# hooks config — same posture as the two-argument `ss` body fallback
+# below (an older hook keeps working, just with the old imprecision).
 #
 # The bus schema this emits against (must match src/modules/claude.rs's
 # CLAUDE_CODE_PATH/CLAUDE_CODE_INTERFACE/STATUS_MEMBER constants):
@@ -60,7 +74,7 @@
 
 set -euo pipefail
 
-STATUS="${1:?usage: emit.sh <working|subagent|attention|done|idle|ended>}"
+STATUS="${1:?usage: emit.sh <working|subagent|subagent-done|attention|done|idle|ended>}"
 
 # --- reading the hook payload ------------------------------------------
 #

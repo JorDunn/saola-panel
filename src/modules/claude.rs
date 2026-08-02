@@ -37,7 +37,8 @@
 //! - Interface `io.saola.ClaudeCode1` ([`CLAUDE_CODE_INTERFACE`]).
 //! - Signal `StatusChanged(session_id: s, status: s, transcript_path: s)`
 //!   ([`STATUS_MEMBER`]), `status` one of `"working"`, `"subagent"`,
-//!   `"attention"`, `"done"`, `"idle"`, `"ended"` (see [`fold`]).
+//!   `"subagent-done"`, `"attention"`, `"done"`, `"idle"`, `"ended"` (see
+//!   [`fold`]).
 //!   `transcript_path` (2026-08-01, for the usage popover) is the session's
 //!   JSONL transcript file, or `""` when the hook had none to report; the
 //!   worker also still accepts the original two-argument `ss` body, so an
@@ -325,6 +326,17 @@ impl Sessions {
     /// right shifts left. Removing an id that isn't tracked is a no-op.
     fn remove(&mut self, id: &str) {
         self.entries.retain(|session| session.id != id);
+    }
+
+    /// The tracked status of a session, if any — [`fold`]'s
+    /// `"subagent-done"` arm reads this to decide whether the stray
+    /// post-turn signal should do anything at all, without reaching past
+    /// `Sessions` into `entries` itself.
+    fn status_of(&self, id: &str) -> Option<SessionStatus> {
+        self.entries
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| session.status)
     }
 
     fn is_empty(&self) -> bool {
@@ -675,17 +687,51 @@ fn breath_at(phase: f32, min: f32) -> f32 {
 ///
 /// The wire's vocabulary is frozen with `contrib/claude-code/emit.sh`:
 /// `working` (Claude is generating), `subagent` (subagents are running
-/// under this session), `attention` (blocked on Jordan), `done` (finished,
-/// awaiting review — the `Stop` hook), `idle` (session open, nothing
-/// happening — the `SessionStart` hook), `ended` (gone).
+/// under this session), `subagent-done` (one subagent finished — see below),
+/// `attention` (blocked on Jordan), `done` (finished, awaiting review — the
+/// `Stop` hook), `idle` (session open, nothing happening — the
+/// `SessionStart` hook), `ended` (gone).
+///
+/// `"subagent-done"` is folded *conditionally*, unlike every other status:
+/// it only rewrites the entry when the session's current status is
+/// [`SessionStatus::Subagents`], flipping it back to [`SessionStatus::
+/// Working`]; against any other current status (or no tracked session at
+/// all) it is a no-op — the entry, if any, keeps whatever it already had.
+/// This is the fix for a stuck-amber dot: `SubagentStop` fires whenever a
+/// background subagent completes, which can happen *after* the turn's own
+/// `Stop` has already reported `"done"` — a long-running `Task` call can
+/// easily outlive the main loop that spawned it. Under the old scheme
+/// (`SubagentStop` emitting plain `"working"`, folded unconditionally like
+/// every other status) that late signal would stomp a `Done`/`Idle`/
+/// `Attention` dot back to amber with nothing left to ever correct it — the
+/// last-writer-wins fold has no way to tell "the turn is still running" from
+/// "a stray straggler finished minutes later." Gating the rewrite on the
+/// *current* status recovers the one case where the old unconditional fold
+/// was actually right — a subagent finishing **mid-turn**, while the dot is
+/// still violet, must still flip it back to amber so Jordan sees the main
+/// loop resume — while making every post-turn case (dot already blue, green,
+/// or red) inert. See `contrib/claude-code/emit.sh` and
+/// `settings.hooks.json.example` for the hook-side half of this schema
+/// change; an un-updated hook config emitting the old `SubagentStop ->
+/// "working"` still folds unconditionally via the `"working"` arm below, so
+/// nothing breaks for a config that hasn't picked up `"subagent-done"` yet.
 ///
 /// `transcript` is the signal's third argument with `""` already mapped to
 /// `None` by the caller — the empty string is the emitter's "I had no
-/// payload to read", not a real path.
+/// payload to read", not a real path. The `"subagent-done"` rewrite goes
+/// through [`Sessions::set`] exactly like every other status so a transcript
+/// path arriving on this signal is captured the same way — there's no
+/// reason for this one arm to skip the usage-popover bookkeeping the others
+/// get for free.
 fn fold(sessions: &mut Sessions, session_id: String, status: &str, transcript: Option<PathBuf>) {
     match status {
         "working" => sessions.set(session_id, SessionStatus::Working, transcript),
         "subagent" => sessions.set(session_id, SessionStatus::Subagents, transcript),
+        "subagent-done" => {
+            if sessions.status_of(&session_id) == Some(SessionStatus::Subagents) {
+                sessions.set(session_id, SessionStatus::Working, transcript);
+            }
+        }
         "attention" => sessions.set(session_id, SessionStatus::Attention, transcript),
         "done" => sessions.set(session_id, SessionStatus::Done, transcript),
         "idle" => sessions.set(session_id, SessionStatus::Idle, transcript),
@@ -969,6 +1015,62 @@ mod tests {
         assert_eq!(statuses(&sessions), vec![SessionStatus::Working]);
     }
 
+    #[test]
+    fn fold_subagent_done_while_subagents_flips_to_working() {
+        // The mid-turn case this status still has to get right: a subagent
+        // finishes while the dot is violet, and the main loop resumes.
+        let mut sessions = Sessions::default();
+        fold(&mut sessions, "a".to_string(), "subagent");
+        fold(&mut sessions, "a".to_string(), "subagent-done");
+        assert_eq!(statuses(&sessions), vec![SessionStatus::Working]);
+    }
+
+    #[test]
+    fn fold_subagent_done_while_done_is_a_no_op() {
+        // The stuck-dot case this status exists to fix: a background
+        // subagent outlives the turn's own `Stop`, so `SubagentStop` fires
+        // after the dot has already gone blue. The stray signal must not
+        // stomp it back to amber.
+        let mut sessions = Sessions::default();
+        fold(&mut sessions, "a".to_string(), "working");
+        fold(&mut sessions, "a".to_string(), "done");
+        fold(&mut sessions, "a".to_string(), "subagent-done");
+        assert_eq!(statuses(&sessions), vec![SessionStatus::Done]);
+    }
+
+    #[test]
+    fn fold_subagent_done_while_idle_or_attention_is_a_no_op() {
+        let mut sessions = Sessions::default();
+        fold(&mut sessions, "a".to_string(), "idle");
+        fold(&mut sessions, "a".to_string(), "subagent-done");
+        assert_eq!(statuses(&sessions), vec![SessionStatus::Idle]);
+
+        let mut sessions = Sessions::default();
+        fold(&mut sessions, "a".to_string(), "attention");
+        fold(&mut sessions, "a".to_string(), "subagent-done");
+        assert_eq!(statuses(&sessions), vec![SessionStatus::Attention]);
+    }
+
+    #[test]
+    fn fold_subagent_done_for_an_unknown_session_creates_no_entry() {
+        let mut sessions = Sessions::default();
+        fold(&mut sessions, "never-seen".to_string(), "subagent-done");
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn fold_legacy_subagent_stop_working_still_flips_the_dot() {
+        // Backwards compatibility: an un-updated hook config still emits
+        // plain `"working"` from `SubagentStop` (the pre-schema-change
+        // wiring), and that must keep folding unconditionally through the
+        // `"working"` arm — same as any other `"working"` signal, whatever
+        // the session's current status.
+        let mut sessions = Sessions::default();
+        fold(&mut sessions, "a".to_string(), "subagent");
+        fold(&mut sessions, "a".to_string(), "working");
+        assert_eq!(statuses(&sessions), vec![SessionStatus::Working]);
+    }
+
     // -- the transcript path -----------------------------------------------
 
     #[test]
@@ -1000,6 +1102,27 @@ mod tests {
         );
         super::fold(&mut sessions, "a".to_string(), "done", None);
         assert_eq!(statuses(&sessions), vec![SessionStatus::Done]);
+        assert_eq!(
+            sessions.entries[0].transcript,
+            Some(PathBuf::from("/t/a.jsonl"))
+        );
+    }
+
+    #[test]
+    fn fold_subagent_done_still_records_a_transcript_when_it_rewrites() {
+        // The Subagents -> Working rewrite goes through `Sessions::set` like
+        // every other status, so a transcript path riding along on this
+        // signal must still be captured, not dropped because this arm is
+        // conditional.
+        let mut sessions = Sessions::default();
+        super::fold(&mut sessions, "a".to_string(), "subagent", None);
+        super::fold(
+            &mut sessions,
+            "a".to_string(),
+            "subagent-done",
+            Some(PathBuf::from("/t/a.jsonl")),
+        );
+        assert_eq!(statuses(&sessions), vec![SessionStatus::Working]);
         assert_eq!(
             sessions.entries[0].transcript,
             Some(PathBuf::from("/t/a.jsonl"))

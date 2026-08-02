@@ -26,9 +26,9 @@
         ]
       }
     ],
-    "PreToolUse": [
+    "SubagentStart": [
       {
-        "matcher": "Task",
+        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -43,7 +43,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh working"
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh subagent-done"
           }
         ]
       }
@@ -55,6 +55,17 @@
           {
             "type": "command",
             "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh done"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh attention"
           }
         ]
       }
