@@ -26,15 +26,44 @@ cargo run
 ```
 
 There is no `--bottom` flag anymore (Stage 14 replaced it — see
-[Configuring it](#configuring-it)): the panel reads `~/.config/saola/panel.kdl` once,
-at boot, and everything about its layout — style, edge, margin, height, module lists,
-mark, color overrides — comes from that file. A restart is required to pick up a config
-change; there is no live reload.
+[Configuring it](#configuring-it)): the panel reads `~/.config/saola/panel.kdl` at
+boot, and everything about its layout — style, edge, margin, height, module lists,
+mark, color overrides — comes from that file. Config changes apply **live**: the
+panel watches the file (inotify) and re-applies it on save — no restart needed. A
+save that doesn't parse keeps the running config (with a warning on stderr) rather
+than resetting the bar mid-edit; deleting the file reverts to the defaults. The one
+thing a running panel can't pick up is a config *directory* created after boot —
+creating `~/.config/saola/` itself needs one restart, after which edits are live.
 
-For quick manual testing without editing the config file, four CLI flags override
-whatever `panel.kdl` says for that one run only: `--ledger` / `--islands` and
-`--top` / `--bottom`. They exist purely as a development convenience (see
+For quick manual testing without editing the config file, five CLI flags override
+whatever `panel.kdl` says for that one run only: `--ledger` / `--islands`,
+`--top` / `--bottom`, and `--config-dir <dir>` (also spelled `--config-dir=<dir>`) —
+the last reads `panel.kdl` from a different directory entirely, so you can iterate
+on a scratch config (`cargo run -- --config-dir /tmp/panel-test`) while your real
+session's panel keeps running against the default, with live-reload following the
+override. They exist purely as a development convenience (see
 `main.rs`/`config::CliOverrides`) — `panel.kdl` is the real interface.
+
+### Installing on Arch
+
+Every GitHub release carries a ready-to-use `PKGBUILD` as a release asset —
+`.github/workflows/pkgbuild-release.yml` fills the version and the tarball's real
+sha256 into the `contrib/aur/PKGBUILD` template when the release is published. To
+install, download it into an empty directory and run `makepkg -si`. The package is
+not on the AUR (yet); when that changes, the same template is what gets pushed
+there — so change `contrib/aur/`, not a downloaded copy.
+
+### Running under systemd
+
+The usual way to start the panel is a `spawn-at-startup "saola-panel"` line in niri's
+config, and nothing more is required. For niri sessions managed by systemd
+(`niri-session` starts `graphical-session.target` and imports `WAYLAND_DISPLAY` /
+`NIRI_SOCKET` into the user environment), `contrib/systemd/saola-panel.service` is a
+user unit that adds crash auto-restart, journal logging, and clean teardown when the
+session ends. The Arch package installs it to `/usr/lib/systemd/user/`, so
+`systemctl --user enable --now saola-panel.service` works out of the box; for a cargo
+install, copy it to `~/.config/systemd/user/`, point `ExecStart` at your binary
+(e.g. `%h/.cargo/bin/saola-panel`), and `systemctl --user daemon-reload` first.
 
 ### Build dependencies
 
@@ -43,15 +72,20 @@ whatever `panel.kdl` says for that one run only: `--ledger` / `--islands` and
 - **niri** is *not* a build dependency — `niri-ipc`'s types compile with no compositor
   present. The niri-columns module simply renders nothing if `$NIRI_SOCKET` is unset at
   runtime.
-- This checkout currently carries a **temporary `[patch]`** in `Cargo.toml` pointing
-  `saola-theme` at a local sibling checkout (`../saola-theme`) instead of the pinned
-  `saola-theme-v0.3.0` tag, pending a theme release that ships the islands' focused-dash
-  fix. Building this repo elsewhere needs that sibling checkout until the patch is
-  retired (see the comment above the `[patch]` block in `Cargo.toml`).
 
 ## Configuring it
 
-`~/.config/saola/panel.kdl` (or `$XDG_CONFIG_HOME/saola/panel.kdl`). Every knob is
+`~/.config/saola/panel.kdl`. The directory resolves most-specific-first:
+
+1. `--config-dir <dir>` (a per-run override, for testing)
+2. `$SAOLA_CONFIG_DIR` — the Saola desktop's own variable, for a session manager to
+   export once; scoped to Saola alone, unlike `$XDG_CONFIG_HOME` below, which
+   relocates every application's config
+3. `$XDG_CONFIG_HOME/saola` (the XDG base-directory spec)
+4. `~/.config/saola` (the spec's fallback for an unset `$XDG_CONFIG_HOME`)
+
+An env var set to the empty string counts as unset, per the XDG spec's own rule.
+Every knob is
 optional; [`examples/panel.kdl`](examples/panel.kdl) documents all of them at their
 built-in default (copying it unchanged into your config is a no-op) and is the
 authoritative reference — read it before editing your own copy.
@@ -213,11 +247,11 @@ bugs:
   readout isn't a control that's switched on). Documented at length in
   `popovers/quick_settings.rs` in case it reads as inconsistent; if Jordan disagrees, the
   fix is a one-line widget swap.
-- **The media row and quick-settings padding reuse tokens that aren't quite the right
-  semantic fit** (`island_gap` for icon↔label spacing inside a pill, `panel_margin_ledger`
-  for popover content padding) rather than inventing local values — flagged as
-  `saola-theme` token candidates (`pill_content_gap`, `popover_padding`) in several
-  handoffs, none acted on since this repo doesn't restyle locally.
+- **Small in-popover gaps still reuse near-fit tokens** (`island_gap` for the tray menu's
+  separator spacing, `pill_gap` for its row insets) rather than inventing local values —
+  flagged in `popovers/tray_menu.rs`'s own doc comment. The popover *content padding*
+  flagged alongside them is resolved: both popovers now pad with the dedicated
+  `sizes.popover_padding` token instead of the `panel_margin_ledger` screen-margin token.
 - **A real SNI application's icon has never been seen on screen** — the wire protocol
   (icon-name lookup, `IconPixmap` byte-shuffle, `Activate`, dbusmenu) is proven end to
   end over a real D-Bus session in this repo's test suite, but no Wayland session was

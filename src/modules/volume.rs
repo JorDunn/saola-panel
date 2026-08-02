@@ -118,7 +118,7 @@ use std::time::Duration;
 
 use iced::futures::channel::mpsc;
 use iced::futures::Stream;
-use iced::widget::{button, row, text, Space};
+use iced::widget::{button, Space};
 use iced::{Element, Subscription};
 use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::context::introspect::{Introspector, SinkInfo};
@@ -249,10 +249,9 @@ const MAX_DISPLAY_PERCENT: f64 = 150.0;
 /// Highest percent that still counts as "low" for icon purposes — i.e. the
 /// `volume-1` (one sound wave) glyph covers 1–49%, `volume-2` (two waves)
 /// covers 50% and up. A two-rung ladder's only sensible split point is its
-/// midpoint; Lucide ships no three-wave variant, so there is no third rung to
-/// place. (0% gets `volume-x` — silence looks like silence whether or not the
-/// mute flag is what caused it; the *color* is what distinguishes real mute,
-/// see [`Volume::view`].)
+/// midpoint. (0% gets the wave-less `volume` glyph and real mute gets
+/// `volume-x` — since the 2026-08-01 icon-only readouts the two states look
+/// different as well as being colored differently, see [`volume_icon`].)
 const LOW_VOLUME_PERCENT_MAX: u32 = 49;
 
 /// How long the worker waits before its first reconnection attempt, and the
@@ -288,32 +287,6 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// Renders the volume glyph + level, or nothing at all when no sink is
-    /// known (`Space::new()` with no size is a zero-area widget — the row
-    /// simply closes up around it).
-    ///
-    /// There is no `button` and no pill here: this is a bare row of icon and
-    /// text drawn straight onto the ink bar, per the settled concept (see the
-    /// module doc comment). Two treatments, both plain theme roles:
-    ///
-    /// - **unmuted** → `on_ink.primary`, full-emphasis ivory. Volume has no
-    ///   "live" state, so terracotta never appears here.
-    /// - **muted** → `on_ink.secondary`, the quiet role — the same "not a
-    ///   dimmed pill, just quieter content" call `network.rs` makes for a
-    ///   disconnected station.
-    ///
-    /// Only the *color* differs between the two, so toggling mute never
-    /// changes the module's width and the right region never jumps. (The
-    /// glyph does swap to `volume-x`, but Lucide's set is metrically even, so
-    /// that costs no layout either.)
-    ///
-    /// Teaching note (one color, two widgets): an iced `Svg` never inherits a
-    /// text color from anything above it (see `media.rs`'s note), so
-    /// `icons::icon` must be handed the tint explicitly, while `text` needs
-    /// its own `.color(..)`. Deriving the role once and passing the same
-    /// `iced::Color` to both is what keeps the glyph and the digits from
-    /// drifting apart. `ColorExt::into_iced` is the hop from a `saola_theme`
-    /// color to iced's own `Color` type.
     /// Whether this module would draw anything right now — the presence
     /// question `Panel::island_view` asks before spending an island pill on
     /// a module. Reads the same field as `view`'s early return, so the two
@@ -336,6 +309,10 @@ impl Volume {
         self.muted
     }
 
+    /// Renders the leveled speaker glyph (a bare click-to-mute button — see
+    /// the inline notes), or nothing at all when no sink is known. Ivory at
+    /// rest, the quiet `secondary` role when muted; never terracotta — a
+    /// level readout is not a control that is switched on.
     pub fn view(&self, theme: &Theme) -> Element<'_, Message> {
         if !self.present {
             return Space::new().into();
@@ -362,32 +339,26 @@ impl Volume {
         // module's footprint out of step with `network`/`battery`/
         // `claude_code`, which are bare rows with no button at all.
         //
-        // This button lives *inside* the status cluster's popover-trigger
-        // `mouse_area` (`main.rs::Panel::popover_trigger`). That is
-        // deliberately safe: iced dispatches events to children first, and
-        // a `mouse_area` only runs its own `on_press` when the content it
-        // wraps did *not* already capture the event
-        // (`iced_widget-0.14.2/src/mouse_area.rs:241`,
-        // `shell.is_event_captured()`). So clicking this glyph toggles mute
-        // without also opening the quick-settings popover; clicking
+        // This button lives *inside* the status cluster's quick-settings
+        // trigger — itself a `bare`-styled button in both layouts
+        // (`main.rs::Panel::status_cluster_trigger` on the ledger bar, the
+        // layered pill in `island_view`'s right arm on islands). Nesting a
+        // button in a button is deliberately safe: iced dispatches events
+        // to children first, and a button skips its own `on_press` when
+        // the content it wraps already captured the event
+        // (`iced_widget-0.14.2/src/button.rs:297`,
+        // `shell.is_event_captured()`). So clicking this glyph toggles
+        // mute without also opening the quick-settings popover; clicking
         // anywhere else in the cluster still does.
-        button(
-            row![
-                icons::icon(
-                    volume_icon(self.percent, muted),
-                    theme.sizes.icon_bar,
-                    content_color,
-                ),
-                text(volume_label(self.percent))
-                    .size(theme.typography.size.bar)
-                    .color(content_color),
-            ]
-            // `sizes.bar_icon_gap` (7.0) is the icon↔value gap inside one
-            // status readout. The `island_gap` is for gaps between
-            // modules, not within them.
-            .spacing(theme.sizes.bar_icon_gap)
-            .align_y(iced::Center),
-        )
+        // Icon-only as of 2026-08-01 (Jordan: the glyph carries the level,
+        // the number lives in the popover's slider row): the speaker ladder
+        // — `volume-x` muted, wave-less `volume`, `volume-1`, `volume-2` —
+        // is the whole readout.
+        button(icons::icon(
+            volume_icon(self.percent, muted),
+            theme.sizes.icon_bar,
+            content_color,
+        ))
         .padding(0)
         .style(style::button::bare(theme, Surface::Ink))
         .on_press(Message::ToggleMute)
@@ -948,26 +919,18 @@ fn percent_to_raw(percent: u32) -> u32 {
 /// mapping for the slider section's own glyph, rather than a second
 /// hand-copied version that could drift from the bar's.
 pub(crate) fn volume_icon(percent: u32, muted: bool) -> Icon {
-    if muted || percent == 0 {
+    if muted {
         Icon::VolumeX
+    } else if percent == 0 {
+        // Not muted, just turned all the way down: the wave-less speaker
+        // (added with the 2026-08-01 icon-only readouts) rather than the
+        // mute cross — the states are different and now look different.
+        Icon::Volume
     } else if percent <= LOW_VOLUME_PERCENT_MAX {
         Icon::Volume1
     } else {
         Icon::Volume2
     }
-}
-
-/// Percent → the row's label, e.g. `45`.
-///
-/// **No `%` suffix**, unlike the battery's label: the concept shows a bare
-/// number next to the speaker glyph. The glyph is what says "this is volume",
-/// so the sign would be redundant chrome, and a level that can legitimately
-/// exceed 100 reads more like a dial position than a proportion anyway. (The
-/// battery keeps its `%` — a charge level genuinely *is* a proportion of a
-/// full cell.) Like the battery's, this leans on the theme's bar font having
-/// tabular numerals so the row doesn't jitter as digits change.
-fn volume_label(percent: u32) -> String {
-    format!("{percent}")
 }
 
 #[cfg(test)]
@@ -1010,8 +973,8 @@ mod tests {
     }
 
     #[test]
-    fn silence_reads_as_muted_even_when_unmuted() {
-        assert_eq!(volume_icon(0, false), Icon::VolumeX);
+    fn unmuted_silence_shows_the_wave_less_speaker_not_the_mute_cross() {
+        assert_eq!(volume_icon(0, false), Icon::Volume);
     }
 
     #[test]
@@ -1024,16 +987,6 @@ mod tests {
         );
         assert_eq!(volume_icon(100, false), Icon::Volume2);
         assert_eq!(volume_icon(150, false), Icon::Volume2);
-    }
-
-    #[test]
-    fn label_shows_a_bare_whole_number() {
-        // No `%` suffix — the speaker glyph carries that meaning. See
-        // `volume_label`'s doc comment for why battery differs.
-        assert_eq!(volume_label(0), "0");
-        assert_eq!(volume_label(45), "45");
-        assert_eq!(volume_label(100), "100");
-        assert_eq!(volume_label(150), "150");
     }
 
     #[test]

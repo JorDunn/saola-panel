@@ -75,8 +75,13 @@
 //! `read_menu(item_id, row_id)`, `Panel::update`'s job to issue) when a row
 //! declares `has_submenu` with **empty** `children` — the lazily-populated
 //! case Stage 20's handoff flagged (`AboutToShow`, then nothing, until
-//! asked) and that this codebase has never actually observed against a real
-//! application.
+//! asked). Once hypothetical, now observed for real: tailscale's exit-node
+//! menu populates exactly this way, and it is also why [`TrayMenuState::
+//! set_menu`] *prunes* the expanded set on a refresh rather than clearing
+//! it — see that method's doc comment for the full failure story. This
+//! recursion plus the lazy fetch is what makes arbitrarily deep menus
+//! (country → city exit-node trees) work: every level expands inline,
+//! fetching only when the application held its children back.
 //!
 //! # Flagged: no check/chevron icons
 //!
@@ -106,16 +111,19 @@
 //!   (10, the closest existing "gap between things" token) rather than a
 //!   dedicated `sizes.popover_separator_gap` — [`separator`]'s doc comment.
 //! - **Row horizontal inset** reuses `sizes.pill_gap` (8) — the same
-//!   "closest existing token, not a bare literal" compromise
-//!   `quick_settings`'s own flagged-gaps section documents for its content
-//!   padding.
+//!   "closest existing token, not a bare literal" compromise as
+//!   [`separator`]'s `island_gap` above. (The popover's *content padding*
+//!   is no such compromise anymore: it uses the dedicated
+//!   `sizes.popover_padding` token, same as `quick_settings`.)
 //!
 //! # Flagged: the popover's height is a fixed row budget, not an estimate
 //!
-//! See [`height`]'s doc comment — worse than `quick_settings::height`'s
-//! "declared estimate" problem, because the async fetch that would tell us
+//! See [`BUDGETED_ROWS`]'s doc comment — the async fetch that would tell us
 //! how many rows there actually are has not even started by the time the
-//! surface's size must be requested.
+//! surface's size must be requested. As of 2026-08-01 the budget is only a
+//! *viewport*: rows beyond it scroll (see [`view`]) rather than being cut
+//! off, so the residual cost is a short menu's blank ink at the bottom —
+//! the same cosmetic mismatch `quick_settings::height` documents.
 //!
 //! # Flagged: horizontal placement doesn't track which icon was clicked
 //!
@@ -136,7 +144,7 @@ use iced::futures::channel::mpsc;
 use iced::futures::stream::StreamExt;
 use iced::futures::{SinkExt, Stream};
 use iced::widget::button::Status as ButtonStatus;
-use iced::widget::{button, column, container, row, rule, text};
+use iced::widget::{button, column, container, row, rule, scrollable, text};
 use iced::{Background, Border, Color, Element, Fill, Subscription};
 use saola_theme::convert::ColorExt;
 use saola_theme::{style, Surface, Theme};
@@ -229,16 +237,30 @@ impl TrayMenuState {
     }
 
     /// Store a freshly-read (or refreshed) menu tree, replacing whatever was
-    /// there. Also clears [`Self::expanded`]: dbusmenu ids "are not stable
-    /// across a `LayoutUpdated`" (`modules::tray::menu`'s own doc comment),
-    /// so an expanded-row id from the *previous* tree could otherwise
-    /// coincidentally name an unrelated row in the new one. This only
-    /// matters for a live refresh (the initial `opening` call already starts
-    /// with an empty set) — a genuinely rare event this codebase has never
-    /// observed against a real application, but cheap to get right anyway.
+    /// there. [`Self::expanded`] is **pruned, not cleared** (2026-08-01):
+    /// ids that no longer name a submenu row in the new tree are dropped,
+    /// but ids that survive keep their expansion.
+    ///
+    /// The earlier version cleared wholesale, on the reasoning that dbusmenu
+    /// ids "are not stable across a `LayoutUpdated`" (`modules::tray::
+    /// menu`'s own doc comment) and a stale id could coincidentally name an
+    /// unrelated row. Then a real application exercised the refresh path:
+    /// tailscale's exit-node menu populates its submenus *lazily* —
+    /// expanding one fires `AboutToShow`, the application fills the subtree
+    /// in and announces `LayoutUpdated`, [`watch`]'s live refresh re-reads
+    /// the whole tree... and clearing here snapped shut the very submenu the
+    /// user had just opened, every time, making nested menus unusable.
+    /// Pruning keeps that flow working while still dropping ids the new
+    /// tree can't account for; the coincidental-id risk is narrowed to ids
+    /// that still name a *submenu* row, where the failure is a submenu
+    /// drawn open that the user didn't open — visible and harmless, against
+    /// the alternative's guaranteed breakage.
     pub fn set_menu(&mut self, menu: Option<Menu>) {
         self.menu = menu;
-        self.expanded.clear();
+        let menu = self.menu.as_ref();
+        self.expanded.retain(|id| {
+            menu.is_some_and(|menu| find_node(&menu.root, *id).is_some_and(|node| node.has_submenu))
+        });
     }
 
     /// Flip one submenu row's expanded/collapsed state.
@@ -319,33 +341,64 @@ fn find_node_mut(node: &mut MenuNode, id: i32) -> Option<&mut MenuNode> {
 /// So this is a generous fixed budget, chosen to comfortably hold the one
 /// real menu this codebase has ever captured (`modules::tray::menu`'s
 /// tailscale fixture: 9 rows, two of them separators) with headroom for
-/// deeper real-world menus. **The honest limitation**: a menu with more
-/// visible rows than this budget has its later rows pushed below the
-/// popover's visible/clickable area — a layer-shell surface cannot draw
-/// outside its own declared bounds, so unlike `quick_settings::height`'s
-/// mismatch (a sliver of blank ink at the bottom, never missing content)
-/// this is genuinely lost content, not merely imprecise. Flagged in the
-/// Stage 21 handoff. A real fix needs either a scrollable row list backed
-/// by a `saola-theme` maximum-menu-height token, or resizing the surface
-/// after the fetch lands (`AnchorSizeChange`/`SizeChange` — already
-/// available, injected by `#[to_layer_message(multi)]`, see `main.rs`'s
-/// `Message` doc comment — but not wired here: a popover changing size
-/// after it opens is its own interaction question this stage does not
-/// take on).
+/// deeper real-world menus. A menu that outgrows it — tailscale's
+/// exit-node tree expanded inline blows straight past any fixed number —
+/// **scrolls** within the surface as of 2026-08-01 (see [`view`]): the
+/// Stage 21 handoff's "genuinely lost content" limitation is closed by the
+/// scrollable row list it proposed. The budget is therefore now just the
+/// popover's *viewport* height, and the remaining (cosmetic) imprecision
+/// is the familiar `quick_settings::height` one: a short menu leaves blank
+/// ink at the bottom. Resizing the surface to fit after the fetch lands
+/// (`AnchorSizeChange`/`SizeChange`) remains future work.
 const BUDGETED_ROWS: f32 = 12.0;
 
 /// The popover surface's declared height — see [`BUDGETED_ROWS`] for why
 /// this is a fixed budget rather than an estimate of one specific menu's
 /// content.
 pub fn height(theme: &Theme) -> f32 {
-    theme.sizes.panel_margin_ledger * 2.0 + theme.sizes.list_row * BUDGETED_ROWS
+    theme.sizes.popover_padding * 2.0 + theme.sizes.list_row * BUDGETED_ROWS
 }
 
 /// The whole popover body: the fetched menu's rows, or a quiet placeholder
 /// while the fetch is still in flight (or failed).
 pub fn view<'a>(theme: &Theme, state: &'a TrayMenuState) -> Element<'a, crate::Message> {
     let content: Element<'a, crate::Message> = match state.menu() {
-        Some(menu) => rows_view(theme, &menu.root.children, state),
+        // Scrollable (2026-08-01): the surface's height is a fixed budget
+        // (see `BUDGETED_ROWS`), and a deep menu with its submenus expanded
+        // inline — tailscale's exit-node tree — overruns it easily. Rows
+        // past the budget used to be genuinely unreachable (a layer-shell
+        // surface cannot draw outside its declared bounds); now they
+        // scroll into view instead. `style::scrollable::rest` is the
+        // theme's one scrollbar treatment, applied unchanged.
+        //
+        // `.spacing(..)` is load-bearing, not cosmetic: without it iced
+        // *floats* the scrollbar over the viewport's right edge, where it
+        // sat on top of the row buttons (Jordan, 2026-08-01: the rail "cuts
+        // into the button area"). With a spacing set the scrollbar is
+        // embedded instead — content and rail laid out side by side, the
+        // given gap between them — so rows end before the rail begins.
+        // Half a `pill_gap`, the "derive from an existing gap" move every
+        // other in-between here makes.
+        //
+        // The inner container's right padding is the other half of the
+        // asymmetric-margins arrangement (see the popover container below):
+        // it tops the container's slim right padding back up to the full
+        // `popover_padding` (`pill_gap + (popover_padding -
+        // pill_gap)`), so a *short* menu — no scrollbar, iced reserves no
+        // rail space — keeps the same right margin as the left. When the
+        // rail does appear it slots into the outer slim-padding zone,
+        // beyond this inner padding, which is exactly the "move the rail
+        // out of the button area, toward the popover's edge" ask.
+        Some(menu) => scrollable(
+            container(rows_view(theme, &menu.root.children, state)).padding(iced::padding::right(
+                theme.sizes.popover_padding - theme.sizes.pill_gap,
+            )),
+        )
+        .width(Fill)
+        .height(Fill)
+        .spacing(theme.sizes.pill_gap / 2.0)
+        .style(style::scrollable::rest(theme, Surface::Ink))
+        .into(),
         None => container(
             text("Loading…")
                 .size(theme.typography.size.bar)
@@ -358,7 +411,17 @@ pub fn view<'a>(theme: &Theme, state: &'a TrayMenuState) -> Element<'a, crate::M
 
     container(content)
         .style(style::container::popover(theme))
-        .padding(theme.sizes.panel_margin_ledger)
+        // Asymmetric on purpose (2026-08-01): `popover_padding` (the
+        // dedicated content-padding token, same as `quick_settings`) on
+        // three sides, but only `pill_gap` on the right, so the
+        // embedded scrollbar rail sits out in what used to be dead margin —
+        // near the popover's right edge — instead of eating that distance
+        // out of the rows' width. The scrollable's inner container (above)
+        // gives the missing `popover_padding - pill_gap` back to the
+        // *content*, so rows keep symmetric margins whether or not the rail
+        // is showing. The vertical margins keep the full-height rail clear
+        // of the popover's rounded corners.
+        .padding(iced::padding::all(theme.sizes.popover_padding).right(theme.sizes.pill_gap))
         .width(Fill)
         .height(Fill)
         .into()
@@ -492,7 +555,10 @@ fn row_view<'a>(theme: &Theme, node: &'a MenuNode, expanded: bool) -> Element<'a
         );
     }
 
-    let content = row(children).spacing(gap).align_y(iced::Center);
+    // `align_y` centres the glyphs against each other; `super::centered`
+    // centres the whole row inside the `list_row`-tall button, which never
+    // centres its own content (see that helper's teaching note).
+    let content = super::centered(row(children).spacing(gap).align_y(iced::Center));
 
     let element = button(content)
         .width(Fill)
@@ -766,11 +832,62 @@ mod tests {
     }
 
     #[test]
-    fn set_menu_clears_expanded_rows() {
+    fn set_menu_prunes_expanded_ids_the_new_tree_cannot_account_for() {
         let mut state = TrayMenuState::opening("item-a".to_string());
         state.expanded.insert(7);
+        // The new tree has no row 7 at all — the id is dropped. Same for a
+        // tree where 7 exists but is no longer a submenu row.
         state.set_menu(Some(Menu::default()));
         assert!(state.expanded.is_empty());
+
+        state.expanded.insert(7);
+        state.set_menu(Some(Menu {
+            revision: 1,
+            root: MenuNode {
+                children: vec![node(7)], // exists, but has_submenu is false
+                ..node(0)
+            },
+        }));
+        assert!(state.expanded.is_empty());
+    }
+
+    /// The lazily-populated flow that forced pruning over clearing (see
+    /// `set_menu`'s doc comment): expand an empty submenu, the application
+    /// populates it and `LayoutUpdated` triggers a full re-read — the row
+    /// the user just opened must still be expanded when the new tree lands.
+    #[test]
+    fn set_menu_keeps_expansion_for_submenu_rows_that_survive_a_refresh() {
+        let submenu_row = |children: Vec<MenuNode>| MenuNode {
+            has_submenu: true,
+            children,
+            ..node(3)
+        };
+
+        let mut state = TrayMenuState::opening("item-a".to_string());
+        state.set_menu(Some(Menu {
+            revision: 0,
+            root: MenuNode {
+                children: vec![submenu_row(vec![])],
+                ..node(0)
+            },
+        }));
+        assert!(
+            state.toggle_expanded(3),
+            "an empty submenu asks for the lazy fetch"
+        );
+
+        // The refresh after the application populated the subtree.
+        state.set_menu(Some(Menu {
+            revision: 1,
+            root: MenuNode {
+                children: vec![submenu_row(vec![node(9)])],
+                ..node(0)
+            },
+        }));
+        assert!(
+            state.is_expanded(3),
+            "the submenu the user just opened stays open across the refresh"
+        );
     }
 
     #[test]

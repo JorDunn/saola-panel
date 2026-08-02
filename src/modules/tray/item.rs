@@ -96,6 +96,7 @@ pub struct TrayItem {
     label: String,
     icon: Option<TrayIcon>,
     status: ItemStatus,
+    is_menu: bool,
 }
 
 impl TrayItem {
@@ -105,6 +106,7 @@ impl TrayItem {
         label: String,
         icon: Option<TrayIcon>,
         status: ItemStatus,
+        is_menu: bool,
     ) -> Self {
         Self {
             id,
@@ -112,6 +114,7 @@ impl TrayItem {
             label,
             icon,
             status,
+            is_menu,
         }
     }
 
@@ -141,6 +144,14 @@ impl TrayItem {
     /// Passive / Active / NeedsAttention — see [`ItemStatus`].
     pub(super) fn status(&self) -> ItemStatus {
         self.status
+    }
+
+    /// Whether the item declared `ItemIsMenu` — "the item only supports the
+    /// context menu" (spec), meaning it has no `Activate` behaviour and a
+    /// left click should open its dbusmenu instead. `Tray::view` is the
+    /// consumer; see its left-click wiring.
+    pub(super) fn is_menu(&self) -> bool {
+        self.is_menu
     }
 }
 
@@ -392,6 +403,16 @@ trait StatusNotifierItem {
     #[zbus(property)]
     fn menu(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
+    /// "The item only supports the context menu, [and] the visualization
+    /// should prefer showing the menu" (spec) — i.e. the item has no
+    /// [`Self::activate`] behaviour at all. True for essentially every
+    /// libdbusmenu/libappindicator-based item (tailscale, discord, ...),
+    /// which don't even *export* an `Activate` method — calling it anyway
+    /// gets `org.freedesktop.DBus.Error.UnknownMethod` back. Read once per
+    /// [`read_item`] re-read, absent-defaults-false like the spec says.
+    #[zbus(property)]
+    fn item_is_menu(&self) -> zbus::Result<bool>;
+
     /// SNI's primary interaction: a left click. `x`/`y` are screen
     /// coordinates some items use to position a window they open in
     /// response — this panel always sends `(0, 0)`; see
@@ -470,8 +491,13 @@ pub(super) async fn read_item(connection: &Connection, id: &str) -> Option<ItemP
         address.bus(),
     );
 
+    // Absent (or mistyped) defaults to false, per the spec's own default —
+    // an item that never heard of `ItemIsMenu` keeps the ordinary
+    // left-click-activates behaviour.
+    let is_menu = proxy.item_is_menu().await.unwrap_or(false);
+
     Some(ItemProbe {
-        item: TrayItem::new(id.to_string(), address, label, icon, status),
+        item: TrayItem::new(id.to_string(), address, label, icon, status, is_menu),
         answered: title.is_some() || name.is_some(),
     })
 }
@@ -517,9 +543,10 @@ fn usable_menu_path(path: &str) -> Option<&str> {
 /// Deliberately *not* cached on [`TrayItem`]: the path is only ever needed at
 /// the moment a menu is opened, which is rare and already several D-Bus
 /// round-trips deep, whereas caching it would mean re-reading it on every
-/// `NewIcon`/`NewStatus`/`NewTitle` signal for every item forever. Stage 21
-/// may well want `ItemIsMenu` on the model for its left-click behaviour —
-/// that is a separate property, and a separate (one-line) decision.
+/// `NewIcon`/`NewStatus`/`NewTitle` signal for every item forever.
+/// `ItemIsMenu`, by contrast, *is* cached on [`TrayItem`] (2026-08-01):
+/// the bar needs it at draw time to decide what a left click even means,
+/// so [`read_item`] reads it with everything else.
 pub(super) async fn read_menu_address(connection: &Connection, id: &str) -> Option<ItemAddress> {
     let address = parse_registration(id)?;
     let proxy = build_item_proxy(connection, &address).await?;
@@ -757,22 +784,18 @@ enum ItemCommand {
 }
 
 /// Connects to the session bus, sends one command to `id`'s item, and lets
-/// the connection drop. Every failure — a malformed id, no session bus, the
-/// item having vanished between the click and the call landing, an item
-/// that doesn't implement a given control — is logged and swallowed: there
-/// is nothing else for `Panel::update` to do with success/failure here, the
-/// same "best-effort, quietly do nothing further" contract as `media.rs`'s
-/// `send_player_command`.
-async fn send_item_command(id: String, command: ItemCommand) {
-    let Some(address) = parse_registration(&id) else {
-        return;
-    };
-    let Ok(connection) = Connection::session().await else {
-        return;
-    };
-    let Some(proxy) = build_item_proxy(&connection, &address).await else {
-        return;
-    };
+/// the connection drop. Failures *reaching* the item — a malformed id, no
+/// session bus, a proxy that can't be built — are swallowed as `None`
+/// (there is nothing for anyone to do with them), while the call's own
+/// error, if any, is handed back for the caller to interpret:
+/// [`send_scroll`] just logs it, but [`send_activate`] reads it to
+/// recognise the menu-only-item case — the same "best-effort" contract as
+/// `media.rs`'s `send_player_command`, minus the swallowing where the
+/// caller genuinely can do something with the answer.
+async fn send_item_command(id: String, command: ItemCommand) -> Option<zbus::Error> {
+    let address = parse_registration(&id)?;
+    let connection = Connection::session().await.ok()?;
+    let proxy = build_item_proxy(&connection, &address).await?;
     let result = match command {
         // Screen coordinates: always `(0, 0)`. A layer-shell surface has no
         // API for "where on the screen was this click" (unlike an X11/xdg
@@ -784,21 +807,49 @@ async fn send_item_command(id: String, command: ItemCommand) {
         ItemCommand::Activate => proxy.activate(0, 0).await,
         ItemCommand::Scroll { delta, orientation } => proxy.scroll(delta, orientation).await,
     };
-    if let Err(error) = result {
-        eprintln!("saola-panel: tray: item command failed: {error}");
-    }
+    result.err()
 }
 
 /// Left-click — SNI's primary interaction. See [`ItemCommand::Activate`]'s
 /// call site above for why the coordinates are always `(0, 0)`.
-pub(super) async fn send_activate(id: String) {
-    send_item_command(id, ItemCommand::Activate).await;
+///
+/// Returns **true when the item turned out to be menu-only**: an
+/// `UnknownMethod` reply means the item exports no `Activate` at all
+/// (libdbusmenu-based items never do — see the proxy's `item_is_menu` doc
+/// comment), which is an *answer*, not a failure — the caller falls back to
+/// opening the item's menu instead, so it is deliberately not logged.
+/// Every other error is logged and swallowed as before.
+pub(super) async fn send_activate(id: String) -> bool {
+    match send_item_command(id, ItemCommand::Activate).await {
+        None => false,
+        Some(error) if is_unknown_method(&error) => true,
+        Some(error) => {
+            eprintln!("saola-panel: tray: item command failed: {error}");
+            false
+        }
+    }
+}
+
+/// Whether a call failed because the method doesn't exist on the object —
+/// the bus's standard `org.freedesktop.DBus.Error.UnknownMethod` reply.
+/// Matched by error *name*, not variant alone: `zbus::Error::MethodError`
+/// carries every named error reply there is (polkit denials,
+/// application-defined errors, ...), and only this one means "this item
+/// has no such control".
+fn is_unknown_method(error: &zbus::Error) -> bool {
+    matches!(
+        error,
+        zbus::Error::MethodError(name, _, _)
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+    )
 }
 
 /// A scroll over the item. `delta`/`orientation` are already reduced from
 /// iced's `mouse::ScrollDelta` by `modules::tray::scroll_units`.
 pub(super) async fn send_scroll(id: String, delta: i32, orientation: &'static str) {
-    send_item_command(id, ItemCommand::Scroll { delta, orientation }).await;
+    if let Some(error) = send_item_command(id, ItemCommand::Scroll { delta, orientation }).await {
+        eprintln!("saola-panel: tray: item command failed: {error}");
+    }
 }
 
 /// One item's change-notification stream, reduced to just its id — the
@@ -974,8 +1025,8 @@ mod tests {
 
     /// Fixture: an item keyed by `id`, with its address derived from that
     /// same string exactly the way the worker derives it. No icon, `Active`
-    /// status — the registry tests below only care about label/id/address
-    /// bookkeeping, not the Stage 19 fields.
+    /// status, not menu-only — the registry tests below only care about
+    /// label/id/address bookkeeping, not the Stage 19/22 fields.
     fn item(id: &str, label: &str) -> TrayItem {
         TrayItem::new(
             id.to_string(),
@@ -983,6 +1034,7 @@ mod tests {
             label.to_string(),
             None,
             ItemStatus::default(),
+            false,
         )
     }
 

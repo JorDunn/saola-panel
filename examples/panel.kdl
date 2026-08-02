@@ -2,9 +2,12 @@
 //
 // This is documentation, not the live config: the panel never reads this
 // file. Copy whichever parts you want into your own config at
-// $XDG_CONFIG_HOME/saola/panel.kdl (usually ~/.config/saola/panel.kdl) —
-// the panel reads that path once, at boot, and needs a restart to notice a
-// change (there is no live-reload).
+// <config-dir>/panel.kdl, where the directory resolves most-specific-first:
+// the --config-dir flag, then $SAOLA_CONFIG_DIR, then
+// $XDG_CONFIG_HOME/saola, then ~/.config/saola (the usual place). The
+// panel reads that path at boot and watches it afterwards, so edits apply
+// live on save (a save that doesn't parse keeps the running config and
+// warns on stderr; deleting the file reverts to the defaults).
 //
 // Every knob below is optional. If a knob (or the whole file) is missing,
 // the panel falls back to exactly the values shown here — this example
@@ -52,19 +55,30 @@ panel {
     // The three regions, left to right (or, in islands mode, the three
     // separate island surfaces). Each is a list of module names in
     // display order — reorder, add, or remove freely. Recognized names
-    // this release: mark, mpris, clock, niri-columns, volume, network,
-    // battery, claude, tray. An unknown name (e.g. a typo, or
-    // "notifications" — excluded from the panel entirely, see below) is
-    // skipped with a warning; the rest of the list still loads.
-    left   { mark; mpris }
-    center { clock; niri-columns }
-    right  { volume; network; battery; claude }
-
-    // `tray` is recognized (it won't warn if you list it) but does not
-    // render anything yet — the system tray module ships in a later
-    // stage. Listing it now is forward-compatible: nothing to change
-    // later.
+    // this release: mark, window-title, mpris, clock, niri-columns, volume,
+    // network, bluetooth, battery, claude, tray. An unknown name (e.g. a
+    // typo, or "notifications" — excluded from the panel entirely, see
+    // below) is skipped with a warning; the rest of the list still loads.
     //
+    // `mpris` is a status-cluster glyph, not a left-region pill (style
+    // guide §7, "Media is a status glyph", 2026-08-01): present only while
+    // an MPRIS player exists, a solid play glyph in terracotta while
+    // playing and ivory while paused, with title/artist/transport living in
+    // the quick-settings popover's media row rather than on the bar itself.
+    // It heads the right region below, ahead of volume — reorder it like
+    // any other name if you'd rather it sit elsewhere in the cluster.
+    //
+    // Two right-region names are special-cased by the layout: `claude`
+    // (the Claude Code session dots) and `tray` each render as their own
+    // standalone group — their own island pill in islands style — beside
+    // the status cluster rather than inside it, in that order: status
+    // cluster, then claude, then tray. Clicking the claude group opens
+    // its usage popover; clicking anywhere else in the status cluster
+    // (mpris's glyph included) opens quick settings.
+    left   { mark; window-title }
+    center { clock; niri-columns }
+    right  { mpris; volume; network; bluetooth; battery; claude; tray }
+
     // "notifications" appears in the Saola design system's own panel
     // sketch but is deliberately out of scope for this panel entirely (a
     // separate saola-notifications component owns it) — listing it here
@@ -78,6 +92,51 @@ panel {
     //   "file:~/.icons/arch.svg" - your own SVG; `~` expands to $HOME
     //   "none"                   - no mark glyph at all
     mark "builtin:horns"
+
+    // Which command clicking the mark glyph runs. A plain command line,
+    // split on whitespace — the first word is the program, the rest are
+    // its arguments (no shell: no quoting, no pipes, no `$HOME`
+    // expansion). "none" disables the click behavior entirely, leaving
+    // the mark exactly as inert as it was before this knob existed.
+    //   "fuzzel"               - the default app launcher (shown here)
+    //   "wofi --show drun"     - a launcher that takes its own arguments
+    //   "none"                 - no click behavior at all
+    launcher "fuzzel"
+
+    // The focused window's title — the quiet text the "window-title" module
+    // draws beside the mark (in islands mode it takes an island of its own
+    // next to the mark's, appearing and vanishing with focus). It shows nothing at all
+    // when no window has focus or the focused window has a blank title, and
+    // it updates from niri's event stream, never from a timer.
+    //
+    //   max-chars - how long a title may get before it is cut, counted in
+    //               characters (not pixels: an approximation under a
+    //               proportional face, but the number a human can reason
+    //               about). Must be a positive whole number.
+    //   overflow  - what happens to a title longer than that:
+    //                 "truncate" - cut it, ending in a single "…" (the
+    //                              default, and the only motionless option)
+    //                 "marquee"  - the opt-in ping-pong scroll: dwell 2s,
+    //                              sweep at 24px/s, dwell 2s, sweep back,
+    //                              repeat. Translation only — nothing fades
+    //                              or scales, and the title never wraps.
+    //                              The panel's only animation besides the
+    //                              Claude Code breath, and it runs *only*
+    //                              while an overflowing title is actually on
+    //                              screen: a title that fits, or a window
+    //                              losing focus, renders exactly like
+    //                              "truncate" and ticks nothing.
+    window-title {
+        max-chars 50
+        overflow "truncate" // or "marquee"
+    }
+
+    // Which glyph heads the Claude Code module's row of session dots (and
+    // the usage-popover trigger it doubles as). Both are built-in brand
+    // marks, drawn in the same theme ivory as every other bar icon:
+    //   "anthropic"   - the Anthropic "A" mark (the default, shown here)
+    //   "claude-code" - Claude Code's own terminal-window mark
+    claude-icon "anthropic"
 
     // Overrides for the three identity colors (ink = every shell surface,
     // paper = a control at rest, accent = on/selected/live). Each is

@@ -182,12 +182,13 @@ impl Tray {
 
 /// One item's bare-on-ink presentation, plus its interactions.
 ///
-/// `mouse_area` rather than a `button` — same reasoning as
-/// `Panel::popover_trigger`: this sits directly on the ink surface with no
-/// fill, and a `button` would draw a background/hover-step/focus ring that
-/// don't belong here. `.interaction(Pointer)` is the one hover affordance
-/// this gets instead — a cursor change, not a visual change to the icon
-/// itself.
+/// `mouse_area` rather than a `button`: this sits directly on the ink
+/// surface with no fill, and a per-icon `button` would draw its own
+/// background/hover-step that don't belong here — the enclosing status
+/// cluster's trigger button already provides the cluster-wide hover
+/// affordance in both layouts. `.interaction(Pointer)` is the one hover
+/// affordance an individual icon gets — a cursor change, not a visual
+/// change to the icon itself.
 fn item_element<'a>(theme: &Theme, item: &'a TrayItem) -> Element<'a, Message> {
     let id = item.id().to_string();
     let size = theme.sizes.icon_bar;
@@ -236,9 +237,23 @@ fn item_element<'a>(theme: &Theme, item: &'a TrayItem) -> Element<'a, Message> {
         ItemStatus::Passive | ItemStatus::Active => glyph,
     };
 
+    // What a left click *means* depends on the item: a menu-only item
+    // (`ItemIsMenu` — anything libdbusmenu/libappindicator-based, e.g.
+    // tailscale) exports no `Activate` method at all, and the spec says the
+    // visualization "should prefer showing the menu" instead — so its left
+    // click opens the same dbusmenu popover a right click does. Everything
+    // else gets SNI's ordinary `Activate` (with `activate`'s own
+    // UnknownMethod fallback catching the items that are menu-only but
+    // never said so).
+    let primary = if item.is_menu() {
+        Message::ContextMenu(id.clone())
+    } else {
+        Message::Activate(id.clone())
+    };
+
     mouse_area(glyph)
         .interaction(iced::mouse::Interaction::Pointer)
-        .on_press(Message::Activate(id.clone()))
+        .on_press(primary)
         .on_right_press(Message::ContextMenu(id.clone()))
         .on_scroll(move |delta| Message::Scroll(id.clone(), delta))
         .into()
@@ -264,12 +279,24 @@ fn scroll_units(delta: ScrollDelta) -> (i32, &'static str) {
     }
 }
 
-/// Left-click on `id`'s item. `Task::future(..).discard()` is the same
-/// command-out shape `media.rs` established in Stage 17: a fresh one-shot
-/// D-Bus call, whose success/failure `Panel::update` has nothing useful to
-/// do with beyond the `eprintln!` already inside `item::send_activate`.
+/// Left-click on `id`'s item — the same command-out shape `media.rs`
+/// established in Stage 17 (a fresh one-shot D-Bus call), but no longer
+/// `.discard()`ed: `send_activate` now answers "did this item turn out to
+/// be menu-only?" (an `UnknownMethod` reply — an item that never declared
+/// `ItemIsMenu` but still exports no `Activate`, see `item_element`'s
+/// left-click comment), and in that one case the task re-emits
+/// [`Message::ContextMenu`] so the click still does something visible:
+/// it opens the item's menu, exactly as if `ItemIsMenu` had been set.
+/// `Task<Option<T>>::and_then` is iced's "continue only on `Some`"
+/// combinator — the `None` (activated fine, or failed for a logged reason)
+/// path produces no message at all, same net effect as the old discard.
 pub fn activate(id: String) -> Task<Message> {
-    Task::future(item::send_activate(id)).discard()
+    Task::future(async move {
+        item::send_activate(id.clone())
+            .await
+            .then_some(Message::ContextMenu(id))
+    })
+    .and_then(Task::done)
 }
 
 /// A scroll over `id`'s item.
@@ -294,6 +321,7 @@ mod tests {
             label.to_string(),
             icon,
             status,
+            false,
         )
     }
 
@@ -413,6 +441,23 @@ mod tests {
         for item in [&svg_item, &raster_item, &pixmap_item, &fallback_item] {
             let _ = item_element(&theme, item);
         }
+    }
+
+    #[test]
+    fn a_menu_only_item_still_renders() {
+        // Exercises `item_element`'s `is_menu` branch (left click = open
+        // the menu) — same "builds without panicking" shape as the other
+        // view tests, since iced can't be asked what a click would send.
+        let theme = Theme::saola();
+        let item = TrayItem::new(
+            ":1.9/StatusNotifierItem".to_string(),
+            item::parse_registration(":1.9/StatusNotifierItem").expect("test ids parse"),
+            "Menu only".to_string(),
+            None,
+            ItemStatus::Active,
+            true,
+        );
+        let _ = item_element(&theme, &item);
     }
 
     #[test]

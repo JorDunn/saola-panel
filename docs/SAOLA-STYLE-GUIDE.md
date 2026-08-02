@@ -29,7 +29,9 @@ Corollaries that follow from the rule and must not be broken:
   on, the thing that is running, or the thing that will happen when you press Enter.
 - There is no third colour. No red for danger, no green for success, no blue for links.
   Severity is carried by **wording**, not hue. A destructive confirm button is
-  terracotta because it is the live action, not because it is dangerous.
+  terracotta because it is the live action, not because it is dangerous. (The session
+  status semaphore below is the single, scoped exception — and it is not a severity
+  scale either.)
 - Only one element in a given surface is terracotta at a time, with one exception:
   a list may have one selected row while a separate toggle is on.
 - Sage `#7A8A5E` exists **only** in the terminal palette (ANSI green) and in the
@@ -74,6 +76,49 @@ Terracotta needs exactly two variants:
 | `accent-light` | `#F6A06B` | Accent-coloured **text on ink** only (hints, error copy, prompt highlights). `#C67139` text on ink fails contrast. |
 | `accent-dark` | `#8C491A` | Accent-coloured **text on ivory** only. |
 
+### Session status semaphore — the one exception
+
+There is exactly one exception to "three colours, never a fourth", added deliberately on
+**2026-07-31** and scoped as narrowly as it is written here.
+
+The panel shows the state of each running Claude Code session as a **16px round dot on
+ink**. That readout has five mutually exclusive states, and they must be legible
+*pre-attentively* — you read the bar out of the corner of your eye, without stopping to
+read words. Ivory-versus-terracotta can say "live / not live"; it cannot say
+"generating" apart from "waiting for you" apart from "finished". So the semaphore gets
+five hues of its own.
+
+| Token | Hex | State | Motion |
+|---|---|---|---|
+| `status-working` | `#DDA23F` | Claude is generating. | Breathes |
+| `status-subagents` | `#A481C7` | Subagents are running under the session. | Breathes |
+| `status-attention` | `#D0544A` | Blocked on you — a prompt, a permission, a question. | Steady |
+| `status-done` | `#6D9EC6` | Finished; output awaiting review. | Steady |
+| `status-idle` | `#82A878` | Session open, nothing happening. | Steady |
+
+**Movement means work in progress.** The two running states breathe; the three settled
+states do not. That split carries as much information as the hue does, so it is not
+optional: never breathe `status-attention` to make it shout, and never freeze
+`status-working` to calm the bar down.
+
+Scope of the exception — all of it:
+
+- **Semaphore dots only.** These five never fill a button, pill, toggle, row, border or
+  text run, and never appear on ivory. Every control in the system still obeys the one
+  rule: ivory fill at rest, terracotta fill when on/selected/live.
+- **They are not a severity scale.** `status-attention` is red because it is one arm of a
+  five-position semaphore, not because red means error. §1 still stands: there is no
+  danger colour, no success colour, and severity is carried by wording.
+- **The palette is not now open.** Adding a sixth status colour, or reusing one of these
+  five for anything that is not a session-status dot, is the same violation the rule
+  always described.
+
+Each value clears 3:1 contrast against ink as a small non-text mark, sits at least ΔE 25
+from the other four, and stays in the muted warm register beside ivory and terracotta —
+none of them is a saturated OS-notification hue. `status-working` is held at least ΔE 20
+away from both `accent` and `accent-light` so a working dot is never read as ordinary
+accent text on the same bar.
+
 ---
 
 ## 2. Surfaces
@@ -107,7 +152,10 @@ Use these exact values so boot → greeter → lock → desktop has no visible i
 
 Translucent panel surfaces over the wallpaper use `rgba(12,10,0,0.60)`–`0.78` with
 `backdrop-filter: blur(12–14px)`. Opaque ink (`#0C0A00`) is correct for popovers,
-launcher and dialogs.
+launcher and dialogs — **and for the panel in both styles** (decided 2026-08-01):
+island pills are solid ink like the ledger bar, not a translucent scrim. The
+translucent scrim treatment remains available for overlay states (launcher,
+overview, lock), not for the resting panel.
 
 ---
 
@@ -167,14 +215,15 @@ Everything is a pill or an over-rounded rectangle. There are no sharp corners.
 |---|---|
 | Panel pill height (islands) | `40px` |
 | Panel bar height (ledger) | `48px` |
-| Panel margin from screen edge | `26px` (islands), `20px` (ledger) |
+| Panel margin from screen edge | `20px` sides, `18px` top — both styles (islands matched to ledger, 2026-08-01) |
+| Gap reserved below the panel | equal to the top margin (`18px`), so tiled windows keep the same breathing room under the panel as above it |
 | Gap between islands | `10px` |
 | Popover top offset from panel | `72px` from screen top |
 | Popover width | `400–460px` |
 | Launcher width | `620–640px` |
 | Notification card width | `440px` |
 | Hit target, minimum | `40px` (bar) / `44px` (touch and lock/greeter) |
-| Icon in bar | `15–16px` |
+| Icon in bar | `15–16px` — `16px` since the icon-only bar readouts (2026-08-01): the glyph is the whole readout, so it takes the top of the range |
 | Icon in menus and rows | `16–19px` |
 | Icon in a bare-icon menu (power) | `30–34px` in an `84px` target |
 | Icon stroke width | **`2.75`** everywhere, at every size |
@@ -196,6 +245,37 @@ Short, and only where it carries meaning.
 | Countdown / progress rule | `1s linear` |
 | Notification popup | see below |
 | Boot rule (indeterminate) | `1.8s ease-in-out` loop |
+| Session status breath | `2.4s ease-in-out` loop, opacity `0.45 → 1 → 0.45` |
+| Window-title marquee (opt-in, off by default) | `24px/s linear` sweep, `2s` dwell at each end — see below |
+
+### The session status breath
+
+The only looping animation in the shell proper. A `status-working` or `status-subagents`
+dot fades between **45% and 100% opacity over one 2.4s cycle** — dim → bright → dim —
+and nothing else about it moves: no scale, no travel, no colour change. 2.4s reads as
+breathing rather than blinking, and the floor is 45% rather than 0 so a dot never
+disappears and reappears.
+
+The three settled states (`attention`, `done`, `idle`) are painted at full opacity and do
+not animate.
+
+### The window-title marquee — opt-in, exact
+
+The focused-window title (§7) caps at a configurable character limit, and the default
+overflow mode simply truncates with a single `…` — no motion. The second mode, enabled
+only by explicit configuration, ping-pongs an overflowing title instead:
+
+1. Dwell **2s** at the head of the title.
+2. Sweep left at **24px/s, linear**, until the tail is fully visible.
+3. Dwell **2s** at the tail.
+4. Sweep back the same way.
+
+Translation only — no fade, no scale, no colour change, and the text never wraps. A
+title within its limit never moves, and the loop stops the moment the focused title
+fits (or focus is lost), so an enabled marquee still ticks only while an overflowing
+title is actually on screen. This is the shell's second sanctioned loop after the
+session status breath — but unlike the breath it is not part of the default design:
+a stock Saola desktop still has exactly one thing that loops.
 
 ### Notification popup timing — exact
 
@@ -208,8 +288,9 @@ Total **6.35s**:
 A terracotta life rule under the card scales from 1 to 0 over the same span. Hover
 pauses both. Urgent notifications have no life rule and never auto-dismiss.
 
-Nothing else in the shell animates. No spinners, no pulsing, no parallax — the whole
-system is built to poll as little as possible and the visuals should reflect that.
+Nothing else in the shell animates. No spinners, no parallax, no pulsing beyond the
+session status breath above, and no continuous motion beyond the opt-in marquee — the
+whole system is built to poll as little as possible and the visuals should reflect that.
 
 ---
 
@@ -284,12 +365,12 @@ enough to show.** Grouped by application, each group collapsible, with a count c
 
 | Surface | Ground | Notes |
 |---|---|---|
-| Panel — Islands (default) | Ink pills over wallpaper | Four separate layer-shell surfaces: mark + media, clock + column strip, status, notifications. Each redraws independently. |
+| Panel — Islands (default) | Solid ink pills over wallpaper | Five separate layer-shell surfaces: mark, window title (present only while a window has focus), clock + column strip, status, notifications. Each redraws independently. Same opaque ink and screen-edge margins as the ledger bar. |
 | Panel — Ledger | One ink bar | Same modules, fixed slots, edge to edge. |
 | Launcher | Ink, 620–640px | One field, ranked rows, group header in serif. Selection terracotta. |
 | Overview | Ink over blurred wallpaper | Workspaces as horizontal strips stacked vertically, window widths proportional to real column widths. |
 | Notification centre | Ink, right | Grouped, collapsible, DND toggle, media footer. |
-| Quick settings | Ink, right | 2×2 toggles, sliders, media. |
+| Quick settings | Ink, right | Power profile selector, battery and Wi-Fi readouts, volume slider, media. Buttons: terracotta fill when active/selected, ivory at rest, per §1's one rule. |
 | Lock | Wallpaper | Clock, date, temperature centred, nothing else. Click reveals avatar → name → password. |
 | Greeter | Wallpaper | Identical to lock plus a user list and a session list as ivory pills below the field. |
 | Power menu | Ink, centred | Bare icons, one shared label. |
@@ -310,6 +391,34 @@ enough to show.** Grouped by application, each group collapsible, with a count c
   Saola's own windows draw a 46px header.
 - **There is no minimise and no taskbar.** Do not add a minimise button. The closest
   equivalent is "Send to workspace", which belongs in the window menu.
+
+### Focused window title (2026-08-01)
+
+The left region's ambient text, to the right of the mark — ledger: bare text on the
+bar; islands: **an island of its own** beside the mark's. It is context, not a state:
+the `secondary` ink-surface role, Sans 500 13px, never terracotta, and the text itself
+never takes pill treatment — in islands style the island is the surface (as every
+island is) and the title is plain text on it, exactly the clock's treatment. No focused
+window, or a window with an empty title, renders nothing — the standard absent-service
+treatment; in islands style the title's island vanishes whole with it, leaving the
+mark's circle alone.
+Title changes arrive as niri IPC events (a signal, per §10), and the only motion this
+module may ever produce is the opt-in marquee specced in §5.
+
+Titles cap at a configurable **character limit** (default `50`) with two configurable
+overflow modes: `truncate` (default — cut at the limit, single `…`, no motion) and
+`marquee` (§5). The limit is measured in characters, not pixels — approximate under a
+proportional face, but it is the knob a human can reason about.
+
+### Media is a status glyph (2026-08-01)
+
+Now-playing lives in the status cluster, not the left region: a single glyph beside
+volume and battery, present only while an MPRIS player exists — solid (filled) play
+glyph in terracotta while playing, ivory while paused, absent otherwise, per §1's rule
+at the element scale. Title, artist and transport controls live in the quick-settings
+media row; clicking the glyph opens quick settings like the rest of the cluster — it
+is a readout, not a transport button. This retires the ledger bar's one subtle-fill
+pill: **in ledger style the clock is now the bar's only pill, full stop.**
 
 ---
 
@@ -378,9 +487,14 @@ panel {
   margin 26
   height 40
 
-  left   { mark; mpris }
+  left   { mark; window-title }
   center { clock; niri-columns }
-  right  { volume; network; battery; tray; notifications }
+  right  { mpris; volume; network; battery; tray; notifications }
+
+  window-title {
+    max-chars 50           // cap before the overflow mode applies
+    overflow "truncate"    // or "marquee" — the opt-in loop, timing in §5
+  }
 
   mark "builtin:horns"     // or "builtin:notch", "file:~/.icons/arch.svg", "none"
 
@@ -405,6 +519,8 @@ question that window should answer.
 5. Are the corners pills or ≥18px radii?
 6. Does the serif appear at most twice, and never inside the bar?
 7. Are icons Lucide at stroke 2.75?
-8. Does anything animate that isn't a notification, a popover, or a hover?
+8. Does anything animate that isn't a notification, a popover, a hover, a breathing
+   session status dot, or the opt-in window-title marquee?
 9. Does every popover close its siblings, open away from its trigger, and hug its content?
-10. Did you add a colour? Remove it.
+10. Did you add a colour? Remove it. (The five session status hues are the one exception,
+    and only as semaphore dots — see §1.)

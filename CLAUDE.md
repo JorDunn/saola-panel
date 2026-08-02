@@ -36,17 +36,24 @@ D-Bus modules (battery = UPower, Wi-Fi = iwd, media = MPRIS, tray = SNI, Claude 
 subscriptions via stream channels — never blocking calls on the UI thread. Non-D-Bus
 signal sources have their own bridges: libpulse (volume) runs on a dedicated thread
 pushing snapshots through an unbounded channel ("thread bridge", handoff 10); niri IPC
-(columns minimap) reads JSON lines from `$NIRI_SOCKET`. **Every module maps to a
-signal, never a poll** — nothing in the panel ticks faster than the clock. A module
-whose service is absent (no battery, no iwd, no pulse, no `$NIRI_SOCKET`) renders
-nothing and must not take the panel down.
+reads JSON lines from `$NIRI_SOCKET` through the shared bridge in `modules/niri.rs`,
+which feeds both the columns minimap and the window-title module with independent
+dedupes. **Every module maps to a signal, never a poll** — nothing in the panel ticks
+faster than the clock. Two sanctioned exceptions, both gated subscriptions rather than
+standing timers: the Claude Code module's session status dots breathe while a
+`working`/`subagent` dot is on screen (decided 2026-07-31 alongside the session-status
+semaphore itself), and the window-title module's opt-in marquee (style guide §5,
+2026-08-01) ticks only while marquee mode is configured *and* an overflowing title is
+actually showing — a stock config never runs it. A module whose service is
+absent (no battery, no iwd, no pulse, no `$NIRI_SOCKET`) renders nothing and must not
+take the panel down.
 Jordan runs **iwd, not NetworkManager** — never write NetworkManager code.
 
 Phase 2 (stages 7–22 in PLAN.md) grows this into the full-spec panel: per-module
 message enums nested in the panel enum, SVG icon infra (Lucide, stroke 2.75), mark +
 MPRIS + volume + niri-columns + Claude Code + tray (full dbusmenu) modules,
 multi-window daemon architecture (`SurfaceRole` registry), KDL config
-(`~/.config/saola/panel.kdl`), Islands layout (three translucent islands; the
+(`~/.config/saola/panel.kdl`), Islands layout (three solid-ink islands; the
 notifications island is a flagged future slot), and popover infrastructure (one open
 at a time) with quick settings.
 
@@ -60,16 +67,23 @@ at a time) with quick settings.
   restyle locally.
 - **Three colors, never a fourth**; the one rule: ivory fill = at rest, terracotta fill =
   on/selected/live. A module's "active" state (charging, connected-and-transferring…) is
-  terracotta per this rule — never a new color, no green/red status colors.
+  terracotta per this rule — never a new color, no green/red status colors. The one
+  scoped exception (decided 2026-07-31): the five session-status semaphore colors from
+  saola-theme (style guide §"Session status semaphore"), used *only* by the Claude Code
+  module's per-session status dots — never by any control or fill. The rule stands
+  everywhere else.
 - On the bar, that rule applies at the *element* scale, not the pill scale (concept 4b,
   PLAN.md Stage 14.5): status modules are bare ivory icon + text directly on ink;
   terracotta marks live states as a small accent (glyph, dot, `accent_light` text),
-  never a whole-pill flood; **in ledger style** the clock is the bar's only solid ivory
-  pill and media its only (subtle-fill) pill besides it. At most one solid terracotta
-  element per surface.
+  never a whole-pill flood; **in ledger style** the clock is the bar's only pill, full
+  stop (amended 2026-08-01: media is a status-cluster glyph — details live in the
+  quick-settings media row — and the left region carries the focused-window-title text;
+  see the guide's §7 subsections). At most one solid terracotta element per surface.
 - **Islands style (listing 2a, "Ink & ivory") differs in surface treatment, not in the
-  rule**: the island scrim is itself the surface, so nothing nests a second one inside
-  it — the clock is plain ivory text on the scrim, never a pill. In the centre island the
+  rule**: the island pill is itself the surface (solid ink, same treatment and
+  screen-edge margins as the ledger bar — decided 2026-08-01; the translucent scrim is
+  retired for the resting panel), so nothing nests a second surface inside it — the
+  clock is plain ivory text on the island, never a pill. In the centre island the
   column strip's focused dash is the one solid ivory element; that dash is a documented
   exception to "terracotta = selected" (terracotta never appears on the strip). Layout
   stays out of module code, but a module's surface treatment may legitimately differ per
@@ -111,3 +125,12 @@ at a time) with quick settings.
   `.github/workflows/release-plz.yml` (needs the `RELEASE_PLZ_TOKEN` repo secret for CI
   to run on release PRs).
 - Changelog-invisible commits use `chore:`/`ci:`/`docs:`/`test:` types.
+- **Arch PKGBUILD**: `.github/workflows/pkgbuild-release.yml` attaches a finished
+  PKGBUILD (version + real sha256 filled into the `contrib/aur/PKGBUILD` template) to
+  every published GitHub release as an asset. Deliberately **not pushed to the AUR**
+  for now — if that changes, add KSXGitHub/github-actions-deploy-aur back to the
+  workflow. Because release events created with the default workflow token don't
+  trigger workflows, automatic firing depends on `RELEASE_PLZ_TOKEN` being set;
+  `workflow_dispatch` with the tag name is the manual fallback. The PKGBUILD only
+  builds from a tag with **no active `[patch]`** on saola-theme — a path override
+  can't resolve on a user's machine.

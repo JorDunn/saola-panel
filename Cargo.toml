@@ -22,7 +22,14 @@ license = "MIT OR Apache-2.0"
 # `bar_*_gap` tokens, and `media_title_max_width` — all new in v0.3.0. This
 # bump also retired the temporary `[patch]` that briefly pointed at the local
 # saola-theme working tree while v0.3.0 was still unreleased.
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.3.0", version = "0.3.0" }
+#
+# Bumped v0.3.0 → v0.5.0 once the theme's column-strip release shipped: the
+# islands centre island needs the focused dash as its one solid ivory element
+# (so the clock stays plain ivory text, per the style guide's islands rules) —
+# the change this repo had been carrying a temporary `[patch]` for. That patch
+# is retired with this bump, same as the Stage 14.5 one before it, and the
+# repo builds standalone again (which the release-attached PKGBUILD requires).
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
 iced_layershell = "0.19"
 # `svg` pulls in `resvg` (via `iced_tiny_skia`) for rasterizing the Lucide
 # icon assets embedded in `src/icons.rs` — see that module for the tinting
@@ -35,7 +42,16 @@ iced_layershell = "0.19"
 # embedded-bitmap fallback — is *always* raster (decoded ARGB32 pixel data,
 # never SVG). `iced_tiny_skia`'s `image` feature pulls in the `image` crate
 # for raster decoding, the same way `svg` pulls in `resvg` for vector.
-iced = { version = "0.14", features = ["tokio", "svg", "image"] }
+#
+# `advanced` exposes `iced::advanced` — the custom-widget API (`Widget`,
+# `layout`, and the renderer's text stack). One widget in this crate needs
+# it: the opt-in window-title marquee (style guide §5) sweeps at a rate given
+# in *pixels* per second, and a string's width in pixels exists only once a
+# renderer has shaped it with a real font. `iced::advanced::text::paragraph`
+# is where iced hands a widget that measurement (and the clipping to draw
+# against it) — see `modules::window_title::Marquee`. It adds no dependency;
+# it only un-gates existing API surface.
+iced = { version = "0.14", features = ["tokio", "svg", "image", "advanced"] }
 chrono = "0.4"
 # D-Bus. `default-features = false` drops zbus's default `async-io` runtime;
 # the `tokio` feature makes it spawn its internal tasks on the tokio runtime
@@ -57,7 +73,7 @@ libpulse-binding = "2.30.1"
 # a hand-written guess at it. Pinned to 26.4, which matches the installed
 # compositor (`niri msg --json version` → 26.04); niri versions its IPC crate
 # in lockstep with the compositor, and fields do move between releases (see
-# `src/modules/columns.rs` for which ones this panel actually reads). Default
+# `src/modules/niri.rs` for which ones this panel actually reads). Default
 # features only — the optional `clap`/`json-schema` features are for niri's
 # own CLI and are not wanted here.
 # The `=` is not paranoia: niri-ipc's own docs state it follows the niri
@@ -113,16 +129,31 @@ freedesktop-icons = "0.4.0"
 # alternative is `#[serde(crate = "zbus::zvariant::export::serde")]` on every
 # type, which is noise. No new code lands in the binary from this line.
 serde = { version = "1", features = ["derive"] }
-
-# TEMPORARY — retire this at the next saola-theme tag bump, exactly as the
-# Stage 14.5 patch described above was retired when v0.3.0 shipped.
-#
-# The islands clock fix needs the theme's unreleased column-strip change (the
-# focused dash becomes the solid ivory element, so the centre island has one
-# solid ivory element and it isn't the clock). Until that lands in a release,
-# the panel builds against the local saola-theme working tree. The `tag` /
-# `version` pair on the dependency line above is deliberately left alone: a
-# `[patch]` overrides the *source*, not the requirement, so the released pin
-# stays recorded and the bump stays a reviewed, single-line change.
-[patch."https://github.com/JorDunn/saola-theme"]
-saola-theme = { path = "../saola-theme/crates/saola-theme" }
+# Stage 22: the screen-brightness module's change signal. There is no D-Bus
+# property for backlight brightness and sysfs attributes emit no usable inotify
+# events, so the only event source is the kernel's udev `change` uevent on the
+# backlight device — the same signal waybar's backlight module listens to.
+# This crate is the safe binding over `libudev.so` (via `libudev-sys`), so a
+# build host needs libudev's headers/pkg-config, exactly like `libpulse-binding`
+# above needs libpulse's. Default features only: the optional `mio*` features
+# adapt the monitor socket to one of four mio generations, and this panel waits
+# on the fd directly (see `libc` below). See `src/modules/brightness.rs` for the
+# thread-bridge pattern this dependency is wrapped in.
+udev = "0.9.3"
+# Named only so `src/modules/brightness.rs` can call `libc::poll` to block on
+# the udev monitor's non-blocking fd — libudev's own documentation prescribes
+# exactly that, and nothing already in the tree wraps a bare "wait on one fd".
+# `libc` was already a transitive dependency several times over (udev, tokio and
+# zbus all pull it in); like the `serde` line above, this adds a *name* rather
+# than new code in the binary.
+libc = "0.2"
+# Live-reload of `panel.kdl`: the kernel's file-change signal, so a config
+# edit reaches the running panel without a restart (see `src/config_watch.rs`).
+# The safe binding over the raw inotify(7) syscalls — Linux-only, which this
+# panel already is (wlr-layer-shell, sysfs, udev). Chosen over the
+# cross-platform `notify` crate because notify spawns and owns its own watcher
+# thread, while inotify's `stream` feature (a default feature; it adapts the
+# inotify fd through tokio's `AsyncFd`, using the `net` feature this crate
+# already enables) yields a plain async `Stream` — which is exactly the shape
+# an iced subscription wants, with no extra thread to bridge.
+inotify = "0.11"

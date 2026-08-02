@@ -1,5 +1,20 @@
 {
+  "statusLine": {
+    "type": "command",
+    "command": "$HOME/Developer/saola-panel/contrib/claude-code/statusline.sh"
+  },
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh idle"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "matcher": "",
@@ -11,13 +26,24 @@
         ]
       }
     ],
-    "Notification": [
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh subagent"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
       {
         "matcher": "",
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh attention"
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh working"
           }
         ]
       }
@@ -28,7 +54,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh idle"
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh done"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/saola-panel/contrib/claude-code/emit.sh attention"
           }
         ]
       }

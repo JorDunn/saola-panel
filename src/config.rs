@@ -1,5 +1,6 @@
 //! `panel.kdl` — the user-facing knobs for layout, module placement, the
-//! mark, and color overrides (style guide §10; PLAN.md Stage 14).
+//! mark (and its launcher), and color overrides (style guide §10; PLAN.md
+//! Stage 14).
 //!
 //! # Why `kdl`, and why by hand (teaching note)
 //!
@@ -108,8 +109,9 @@ pub enum Edge {
 }
 
 /// Every module name this phase recognizes in a `left`/`center`/`right`
-/// list, per PLAN.md Stage 14's list: `mark`, `mpris`, `clock`,
-/// `niri-columns`, `volume`, `network`, `battery`, `claude`, `tray`.
+/// list, per PLAN.md Stage 14's list: `mark`, `window-title`, `mpris`,
+/// `clock`, `niri-columns`, `volume`, `network`, `bluetooth`, `battery`,
+/// `claude`, `tray`.
 ///
 /// `notifications` (present in the style guide's own `panel { }` sketch) is
 /// **deliberately absent** — Phase 2 excludes everything notifications
@@ -126,11 +128,17 @@ pub enum Edge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleName {
     Mark,
+    /// The focused window's title (style guide §7, 2026-08-01) — ambient text
+    /// to the right of the mark. Its own knobs live in the top-level
+    /// `window-title { }` block, not here: this enum only says *where* a
+    /// module sits (see [`WindowTitleConfig`]).
+    WindowTitle,
     Mpris,
     Clock,
     NiriColumns,
     Volume,
     Network,
+    Bluetooth,
     Battery,
     Claude,
     Tray,
@@ -144,11 +152,13 @@ impl ModuleName {
     fn parse(name: &str) -> Option<Self> {
         match name {
             "mark" => Some(Self::Mark),
+            "window-title" => Some(Self::WindowTitle),
             "mpris" => Some(Self::Mpris),
             "clock" => Some(Self::Clock),
             "niri-columns" => Some(Self::NiriColumns),
             "volume" => Some(Self::Volume),
             "network" => Some(Self::Network),
+            "bluetooth" => Some(Self::Bluetooth),
             "battery" => Some(Self::Battery),
             "claude" => Some(Self::Claude),
             "tray" => Some(Self::Tray),
@@ -199,12 +209,149 @@ impl MarkSource {
     }
 }
 
+/// Which glyph heads the Claude Code module's session-dot row, chosen by
+/// the top-level `claude-icon "…"` directive. A closed two-value set (like
+/// `style`/`edge`, unlike `mark`'s open `file:` form): both glyphs are
+/// embedded brand assets (`crate::icons::Icon::{Anthropic, ClaudeCode}`),
+/// and a user SVG here would be a third brand where the design language
+/// wants a known mark — anyone who feels strongly can still ask for the
+/// knob to grow a `file:` form later. Consumed by
+/// `modules::claude::ClaudeCode`, which stores one of these at boot and
+/// switches on it in `view` — the same "config picks, module renders" split
+/// as [`MarkSource`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaudeIcon {
+    /// `claude-icon "anthropic"` — the Anthropic "A" mark. Also the
+    /// fallback for an absent directive, matching the default glyph the
+    /// module drew before this knob existed.
+    #[default]
+    Anthropic,
+    /// `claude-icon "claude-code"` — Claude Code's own terminal-window mark.
+    ClaudeCode,
+}
+
+impl ClaudeIcon {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "anthropic" => Some(Self::Anthropic),
+            "claude-code" => Some(Self::ClaudeCode),
+            _ => None,
+        }
+    }
+}
+
+/// What the focused-window-title module does with a title longer than its
+/// character limit (style guide §7's two modes; the motion of the second is
+/// specced exactly in §5).
+///
+/// A closed two-value set, like `style`/`edge`/`claude-icon` — so an
+/// unrecognized value warns and falls back to the default, per the module
+/// doc comment's per-knob resilience rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TitleOverflow {
+    /// `overflow "truncate"` — cut at the limit with a single `…`, no motion.
+    /// The default, and the whole of a stock Saola desktop's behavior.
+    #[default]
+    Truncate,
+    /// `overflow "marquee"` — the opt-in ping-pong sweep (style guide §5:
+    /// 2s dwell, 24px/s linear, 2s dwell, back).
+    ///
+    /// The one knob in `panel.kdl` that starts an animation, which is why it
+    /// is opt-in and why the module gates it so tightly: a title that fits
+    /// (or a window losing focus) renders exactly like
+    /// [`Truncate`](Self::Truncate) and runs no timer at all. See
+    /// `modules::window_title` for the state machine and the gate.
+    Marquee,
+}
+
+impl TitleOverflow {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "truncate" => Some(Self::Truncate),
+            "marquee" => Some(Self::Marquee),
+            _ => None,
+        }
+    }
+}
+
+/// The default `max-chars`, straight from the style guide (§7: "Titles cap at
+/// a configurable **character limit** (default `50`)").
+pub const DEFAULT_TITLE_MAX_CHARS: usize = 50;
+
+/// `window-title { max-chars 50; overflow "truncate" }` — the focused-window
+/// title's two knobs, resolved to concrete values (unlike `margin`/`height`,
+/// neither of these has a theme token to defer to, so there is no `Option`
+/// to resolve later).
+///
+/// `max_chars` is a count of **characters**, not pixels: approximate under a
+/// proportional face, but the knob a human can reason about (style guide §7).
+/// `usize` because that is what the truncation walks with; the parser is what
+/// guarantees it is positive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowTitleConfig {
+    pub max_chars: usize,
+    pub overflow: TitleOverflow,
+}
+
+impl Default for WindowTitleConfig {
+    fn default() -> Self {
+        Self {
+            max_chars: DEFAULT_TITLE_MAX_CHARS,
+            overflow: TitleOverflow::Truncate,
+        }
+    }
+}
+
+/// The built-in launcher command for an absent `launcher` directive — see
+/// [`read_launcher`]. `fuzzel` is the default app launcher this panel ships
+/// alongside; anyone running a different one overrides it with one line.
+pub const DEFAULT_LAUNCHER: &str = "fuzzel";
+
 /// A leading `~/` (or a bare `~`) expands against `$HOME`; anything else
 /// passes through unchanged. Deliberately minimal — no `~user/` form, no
 /// crate dependency — because the style guide's own example
 /// (`file:~/.icons/arch.svg`) only needs the common case.
 fn expand_tilde(path: &str) -> PathBuf {
     expand_tilde_with_home(path, std::env::var_os("HOME"))
+}
+
+/// The testable core of [`PanelConfig::resolve_path`]'s directory chain:
+/// takes every environment variable as a plain argument instead of reading
+/// the environment itself, for exactly the reason [`expand_tilde_with_home`]
+/// below does — precedence can be unit-tested without mutating (and thereby
+/// racing every other test in this binary against) the process's real
+/// environment.
+///
+/// An env var set to the **empty string** is treated as unset and falls
+/// through to the next rung — the XDG spec's own rule for
+/// `$XDG_CONFIG_HOME` ("if $XDG_CONFIG_HOME is either not set or empty"),
+/// applied uniformly to `$SAOLA_CONFIG_DIR` too, since `VAR= cmd` is how a
+/// shell one-liner *clears* a variable, not how it names a directory.
+fn config_dir_from(
+    cli: Option<&Path>,
+    saola: Option<std::ffi::OsString>,
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(dir) = cli {
+        return Some(dir.to_path_buf());
+    }
+    if let Some(saola) = saola {
+        if !saola.is_empty() {
+            return Some(PathBuf::from(saola));
+        }
+    }
+    if let Some(xdg) = xdg {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("saola"));
+        }
+    }
+    // The same empty-means-unset rule as the two vars above — a `HOME=""`
+    // would otherwise produce the *relative* path `.config/saola`, i.e. a
+    // config resolved against whatever directory the panel happened to be
+    // started from.
+    home.filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".config/saola"))
 }
 
 /// The testable core of [`expand_tilde`]: takes `$HOME` as a plain
@@ -253,10 +400,11 @@ impl ColorOverrides {
     }
 }
 
-/// The whole of `panel.kdl`, resolved to typed values — loaded once at boot
-/// (`PanelConfig::load`) and then read-only for the rest of the process's
-/// life (there is no live-reload; a config edit needs a restart, same as
-/// `--bottom` needed one before this stage).
+/// The whole of `panel.kdl`, resolved to typed values — loaded at boot
+/// (`PanelConfig::load`) and re-loaded live whenever the file changes on
+/// disk ([`Self::reload_from`], driven by the `config_watch` subscription;
+/// `main.rs`'s reload arm is what re-applies the result to the running
+/// panel).
 ///
 /// `margin`/`height` are `Option<f32>` rather than plain `f32`: "absent
 /// knob → today's behavior" (the module doc comment's resilience rules)
@@ -278,13 +426,38 @@ pub struct PanelConfig {
     pub center: Vec<ModuleName>,
     pub right: Vec<ModuleName>,
     pub mark: MarkSource,
+    /// Which command clicking the mark glyph runs (`modules::mark::Mark`'s
+    /// click handler — see that module's doc comment). `Some(cmd)` is the
+    /// command line to spawn (default [`DEFAULT_LAUNCHER`], `"fuzzel"`);
+    /// `None` is the `launcher "none"` directive, which disables the mark's
+    /// click behavior entirely (it renders as the same bare, unclickable
+    /// glyph the panel always drew before this knob existed). Resolved at
+    /// parse time, same as `mark` above.
+    pub launcher: Option<String>,
+    /// Which glyph the Claude Code module leads its dot row with — see
+    /// [`ClaudeIcon`].
+    pub claude_icon: ClaudeIcon,
+    /// The focused-window-title module's own knobs — see
+    /// [`WindowTitleConfig`]. A *block* rather than two top-level directives
+    /// because that is the shape the style guide's own §10 sketch writes, and
+    /// because both knobs belong to one module.
+    pub window_title: WindowTitleConfig,
     pub colors: ColorOverrides,
 }
 
 impl Default for PanelConfig {
-    /// Identical to the panel's hardcoded pre-Stage-14 layout: mark+mpris
-    /// left, clock+niri-columns center, volume/network/battery/claude
-    /// right, top edge, ledger style, the built-in horns mark, no color
+    /// The style guide's own module order: mark+window-title left,
+    /// clock+niri-columns center,
+    /// mpris/volume/network/bluetooth/battery/claude/tray right (media
+    /// moved here from the left region on 2026-08-01 — style guide §7,
+    /// "Media is a status glyph" — and heads the cluster, ahead of
+    /// volume; Bluetooth sits with the other radios, immediately after
+    /// Wi-Fi; `claude` and `tray` close the region — and `main.rs` renders
+    /// those two as standalone groups *beside* the status cluster rather
+    /// than inside it, see `Panel::bar_view`'s right-region split, decided
+    /// 2026-08-01: the Claude Code dots are their own island immediately
+    /// left of the tray). Top edge, ledger style, the built-in horns mark
+    /// clicking through to `fuzzel` ([`DEFAULT_LAUNCHER`]), no color
     /// overrides. This is also what an absent `panel.kdl` produces, and
     /// what a garbage one falls back to in full.
     fn default() -> Self {
@@ -293,15 +466,21 @@ impl Default for PanelConfig {
             edge: Edge::Top,
             margin: None,
             height: None,
-            left: vec![ModuleName::Mark, ModuleName::Mpris],
+            left: vec![ModuleName::Mark, ModuleName::WindowTitle],
             center: vec![ModuleName::Clock, ModuleName::NiriColumns],
             right: vec![
+                ModuleName::Mpris,
                 ModuleName::Volume,
                 ModuleName::Network,
+                ModuleName::Bluetooth,
                 ModuleName::Battery,
                 ModuleName::Claude,
+                ModuleName::Tray,
             ],
             mark: MarkSource::BuiltinHorns,
+            launcher: Some(DEFAULT_LAUNCHER.to_string()),
+            claude_icon: ClaudeIcon::Anthropic,
+            window_title: WindowTitleConfig::default(),
             colors: ColorOverrides::default(),
         }
     }
@@ -332,11 +511,13 @@ impl PanelConfig {
     }
 
     /// The panel's **inset from the screen edge** (logical pixels,
-    /// horizontal): the `margin` knob if set, otherwise the token matching
-    /// the current `style` — `panel_margin_ledger` for Ledger (today's only
-    /// rendered style), `panel_margin_islands` for Islands (unused until
-    /// Stage 15, but resolved correctly now so that stage doesn't have to
-    /// revisit this method).
+    /// horizontal): the `margin` knob if set, otherwise
+    /// `panel_margin_ledger` — for **both** styles. Islands originally used
+    /// the wider `panel_margin_islands` (26); Jordan matched the two on
+    /// 2026-08-01 (islands now share the ledger bar's inset, recorded in the
+    /// style guide's Sizes table), so the style no longer changes the
+    /// resolved margin. The match stays written out so a future style with a
+    /// genuinely different inset has an obvious slot.
     ///
     /// This is the style guide's own meaning of "panel margin", and as of
     /// the floating-pill change it is literally that: `main.rs` feeds it to
@@ -349,39 +530,57 @@ impl PanelConfig {
     /// token, with no config knob of its own.
     pub fn margin(&self, theme: &saola_theme::Theme) -> f32 {
         self.margin.unwrap_or(match self.style {
-            PanelStyle::Ledger => theme.sizes.panel_margin_ledger,
-            PanelStyle::Islands => theme.sizes.panel_margin_islands,
+            PanelStyle::Ledger | PanelStyle::Islands => theme.sizes.panel_margin_ledger,
         })
     }
 
-    /// `$XDG_CONFIG_HOME/saola/panel.kdl`, falling back to
-    /// `~/.config/saola/panel.kdl` per the XDG base-directory spec (and per
-    /// PLAN.md Stage 14's stated default). `None` only when neither
-    /// `$XDG_CONFIG_HOME` nor `$HOME` is set — an environment this
-    /// resilient-by-design loader treats the same as "no file": defaults.
-    fn path() -> Option<PathBuf> {
-        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return Some(PathBuf::from(xdg).join("saola/panel.kdl"));
-            }
-        }
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/saola/panel.kdl"))
+    /// Where `panel.kdl` lives: the resolved config **directory** joined
+    /// with the fixed file name. `main` calls this exactly once, at boot,
+    /// and threads the result to both consumers — [`Self::load`] and the
+    /// `config_watch` worker — so the loader and the watcher cannot end up
+    /// pointed at different files.
+    ///
+    /// The directory itself resolves most-specific-first, the same
+    /// precedence the style/edge flags already have over their file knobs:
+    ///
+    /// 1. **`--config-dir <dir>`** — [`CliOverrides::config_dir`], a
+    ///    per-run override (iterate on a scratch config while the real
+    ///    session's panel keeps running against the default).
+    /// 2. **`$SAOLA_CONFIG_DIR`** — the Saola desktop's own env var, for a
+    ///    session manager to export once and every Saola component to
+    ///    honor. Scoped to Saola alone, unlike `$XDG_CONFIG_HOME` below,
+    ///    which relocates *every* application's config.
+    /// 3. **`$XDG_CONFIG_HOME/saola`** — the XDG base-directory spec.
+    /// 4. **`~/.config/saola`** — the spec's own fallback for an unset
+    ///    `$XDG_CONFIG_HOME` (and PLAN.md Stage 14's stated default).
+    ///
+    /// `None` only when nothing in the chain resolves — no flag, no Saola
+    /// or XDG var, and no `$HOME` — an environment this resilient-by-design
+    /// loader treats the same as "no file": defaults, and no watch.
+    pub(crate) fn resolve_path(cli_dir: Option<&Path>) -> Option<PathBuf> {
+        config_dir_from(
+            cli_dir,
+            std::env::var_os("SAOLA_CONFIG_DIR"),
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
+        .map(|dir| dir.join("panel.kdl"))
     }
 
-    /// Load the config once at boot. Never fails — see the module doc
-    /// comment's resilience rules; every error path prints a warning (via
+    /// Load the config at boot, from the path [`Self::resolve_path`] gave
+    /// `main` (`None` — nothing in the resolution chain was set — loads
+    /// pure defaults; not a warning-worthy situation: a container/CI
+    /// environment with no `$HOME` is not "broken config", it's "no config
+    /// is possible here"). Never fails — see the module doc comment's
+    /// resilience rules; every error path prints a warning (via
     /// `eprintln!`, since this runs before iced's event loop exists — there
     /// is no bar surface yet to show an error on) and returns a value, not
     /// a `Result`.
-    pub fn load() -> Self {
-        let Some(path) = Self::path() else {
-            // No $XDG_CONFIG_HOME and no $HOME: nothing to even try to
-            // read. Not a warning-worthy situation — a container/CI
-            // environment with neither set is not "broken config", it's
-            // "no config is possible here".
+    pub fn load(path: Option<&Path>) -> Self {
+        let Some(path) = path else {
             return Self::default();
         };
-        Self::load_from(&path)
+        Self::load_from(path)
     }
 
     fn load_from(path: &Path) -> Self {
@@ -402,6 +601,42 @@ impl PanelConfig {
                     path.display()
                 );
                 Self::default()
+            }
+        }
+    }
+
+    /// Re-read the config for a **live reload** (`config_watch` calls this
+    /// after inotify reports the file changed). `None` means "keep whatever
+    /// config the panel is already running".
+    ///
+    /// The resilience rules here deliberately differ from [`Self::load_from`]
+    /// in exactly one case, because the two run at different moments:
+    ///
+    /// - **File missing** → `Some(default)`. At boot that meant "nobody wrote
+    ///   a config"; mid-session it means the user *deleted* it, and reverting
+    ///   the running panel to defaults is what honoring that edit looks like.
+    /// - **File present but not valid KDL** → warn, then `None`. Boot has no
+    ///   previous config to keep, so it falls back to defaults — but a live
+    ///   panel does, and a half-saved edit (or a typo mid-editing-session)
+    ///   flashing the whole bar back to the stock layout would punish the
+    ///   user for a keystroke. Keeping the current config until the file
+    ///   parses again is the kinder failure, and the warning on stderr still
+    ///   says why nothing visibly changed.
+    /// - **File parses** → `Some(config)`, per-knob resilience exactly as at
+    ///   boot (a typo'd knob warns and defaults; the rest of the file lands).
+    pub fn reload_from(path: &Path) -> Option<Self> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(_) => return Some(Self::default()),
+        };
+        match Self::parse(&contents) {
+            Ok(config) => Some(config),
+            Err(err) => {
+                eprintln!(
+                    "saola-panel: {} is not valid KDL ({err}) — keeping the current config",
+                    path.display()
+                );
+                None
             }
         }
     }
@@ -446,6 +681,14 @@ impl PanelConfig {
             .and_then(|value| match_or_warn(value, "mark", MarkSource::parse))
             .unwrap_or_default();
 
+        let launcher = read_launcher(body);
+
+        let claude_icon = read_arg_str(body, "claude-icon")
+            .and_then(|value| match_or_warn(value, "claude-icon", ClaudeIcon::parse))
+            .unwrap_or_default();
+
+        let window_title = read_window_title(body);
+
         let colors = read_colors(body);
 
         Ok(PanelConfig {
@@ -457,30 +700,46 @@ impl PanelConfig {
             center,
             right,
             mark,
+            launcher,
+            claude_icon,
+            window_title,
             colors,
         })
     }
 }
 
 /// Command-line overrides for quick testing: `--ledger`, `--islands`,
-/// `--top`, `--bottom`. A flag beats the corresponding `panel.kdl` knob,
-/// which beats the built-in default — so `cargo run -- --islands` tries the
-/// Islands layout without editing (or even having) a config file, and the
-/// next plain `cargo run` is back to whatever the file says.
+/// `--top`, `--bottom`, `--config-dir <dir>`. A flag beats the
+/// corresponding `panel.kdl` knob, which beats the built-in default — so
+/// `cargo run -- --islands` tries the Islands layout without editing (or
+/// even having) a config file, and the next plain `cargo run` is back to
+/// whatever the file says.
 ///
 /// Same `Option`-per-field shape as [`ColorOverrides`]: `None` means "this
 /// flag wasn't given, leave the config value alone". Only the two
-/// mode-switch knobs are exposed — flags are a testing convenience, not a
-/// second config surface; anything richer belongs in `panel.kdl`.
+/// mode-switch knobs and the config location are exposed — flags are a
+/// testing convenience, not a second config surface; anything richer
+/// belongs in `panel.kdl`.
 ///
 /// (Historical note: Stage 14 removed the original v0.1 `--bottom` flag in
 /// favor of `edge "bottom"` in the config file. This brings it back with
 /// different semantics — an *override on top of* the file rather than the
 /// only knob there is.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliOverrides {
     pub style: Option<PanelStyle>,
     pub edge: Option<Edge>,
+    /// `--config-dir <dir>` (or `--config-dir=<dir>`): read `panel.kdl`
+    /// from this directory instead of the `$SAOLA_CONFIG_DIR`/XDG chain —
+    /// the head of [`PanelConfig::resolve_path`]'s precedence list. Unlike
+    /// `style`/`edge` above, this one is **not** applied by [`Self::apply`]
+    /// (it isn't a `PanelConfig` field): it decides where the config *is*,
+    /// so `main` consumes it before the file is ever read, and the
+    /// live-reload watcher follows the same resolved path. It is also the
+    /// field that cost this struct its `Copy` (a `PathBuf` owns heap) —
+    /// callers clone instead, which is just as cheap for a value this
+    /// small and this rarely passed around.
+    pub config_dir: Option<PathBuf>,
 }
 
 impl CliOverrides {
@@ -498,22 +757,72 @@ impl CliOverrides {
     /// never kill the bar, same as a typo'd knob in `panel.kdl` doesn't.
     /// If contradictory flags are given (`--ledger --islands`), the last
     /// one wins, like shadowing a shell variable.
+    ///
+    /// `--config-dir` is the one flag that takes a value, in either
+    /// conventional spelling: `--config-dir /some/dir` (the value is the
+    /// next argument) or `--config-dir=/some/dir`. A `--config-dir` with no
+    /// usable value — last on the line, `--config-dir=` with nothing after
+    /// the `=`, an empty string, or a following argument that is itself a
+    /// flag (`--config-dir --islands` is almost certainly a forgotten
+    /// value, so `--islands` is *not* swallowed as a directory named
+    /// "--islands": the missing value warns and the flag then applies
+    /// normally; a genuine directory whose name starts with `--` can still
+    /// be given via the `=` form) — warns and is ignored, the same fate as
+    /// any other unusable argument. The value gets the same `~/` expansion
+    /// as `mark`'s `file:` form ([`expand_tilde`]) — a shell expands `~`
+    /// itself, but a value arriving through an exec line or a `.desktop`
+    /// file doesn't get that pass, and "expand the common case" costs
+    /// nothing.
     pub fn parse<I, S>(args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         let mut overrides = Self::default();
+        // `--config-dir`'s two-token form is parsed with a one-step state
+        // flag rather than an extra `.next()` inside the loop body: the
+        // "value" that follows may turn out to be a flag itself (see the
+        // doc comment), and this shape lets such an argument fall through
+        // to the ordinary `match` below instead of being consumed as a
+        // directory and lost.
+        let mut awaiting_dir = false;
         for arg in args {
-            match arg.as_ref() {
+            let arg = arg.as_ref();
+            if awaiting_dir {
+                awaiting_dir = false;
+                if !arg.is_empty() && !arg.starts_with("--") {
+                    overrides.config_dir = Some(expand_tilde(arg));
+                    continue;
+                }
+                eprintln!("saola-panel: --config-dir needs a directory argument — ignored");
+                // Deliberately no `continue`: whatever this argument was,
+                // it wasn't a directory, so it gets its normal treatment
+                // below (a real flag applies; anything else warns as
+                // unrecognized).
+            }
+            match arg {
                 "--ledger" => overrides.style = Some(PanelStyle::Ledger),
                 "--islands" => overrides.style = Some(PanelStyle::Islands),
                 "--top" => overrides.edge = Some(Edge::Top),
                 "--bottom" => overrides.edge = Some(Edge::Bottom),
+                "--config-dir" => awaiting_dir = true,
                 other => {
-                    eprintln!("saola-panel: unrecognized argument \"{other}\" — ignored");
+                    if let Some(dir) = other.strip_prefix("--config-dir=") {
+                        if dir.is_empty() {
+                            eprintln!(
+                                "saola-panel: --config-dir= needs a directory argument — ignored"
+                            );
+                        } else {
+                            overrides.config_dir = Some(expand_tilde(dir));
+                        }
+                    } else {
+                        eprintln!("saola-panel: unrecognized argument \"{other}\" — ignored");
+                    }
                 }
             }
+        }
+        if awaiting_dir {
+            eprintln!("saola-panel: --config-dir needs a directory argument — ignored");
         }
         overrides
     }
@@ -610,6 +919,72 @@ fn read_module_list(body: Option<&KdlDocument>, list_name: &str) -> Option<Vec<M
     Some(modules)
 }
 
+/// Reads the top-level `launcher "…"` directive. Unlike `mark` (a closed set
+/// of prefixes matched against `MarkSource::parse`) or `style`/`edge` (a
+/// closed set of named values), a launcher is a free-form shell command
+/// line — almost any string is "valid" here, there's no typo to warn about,
+/// so this has no `match_or_warn` step. Only one string is special-cased:
+/// the literal `"none"`, which disables the mark's click behavior rather
+/// than being passed to `std::process::Command` as a (nonsensical) program
+/// name. An absent directive resolves to [`DEFAULT_LAUNCHER`] — the mark is
+/// clickable out of the box, matching the style guide's "bare-icon menu"
+/// being a real menu trigger, not a decoration.
+fn read_launcher(body: Option<&KdlDocument>) -> Option<String> {
+    match read_arg_str(body, "launcher") {
+        None => Some(DEFAULT_LAUNCHER.to_string()),
+        Some("none") => None,
+        Some(command) => Some(command.to_string()),
+    }
+}
+
+/// Reads `window-title { max-chars 50; overflow "truncate" }` — the style
+/// guide §10 sketch's own block, verbatim.
+///
+/// Same knob-by-knob resilience as `colors { }` just below: an absent block,
+/// a block that only sets one of the two, a nonsense `overflow`, or a
+/// `max-chars` that isn't a positive integer each fall back to that one
+/// knob's default (warning where there is a typo to warn about) rather than
+/// discarding the block.
+fn read_window_title(body: Option<&KdlDocument>) -> WindowTitleConfig {
+    let Some(block) = body
+        .and_then(|d| d.get("window-title"))
+        .and_then(|n| n.children())
+    else {
+        return WindowTitleConfig::default();
+    };
+
+    let defaults = WindowTitleConfig::default();
+    WindowTitleConfig {
+        max_chars: read_max_chars(block).unwrap_or(defaults.max_chars),
+        overflow: read_arg_str(Some(block), "overflow")
+            .and_then(|value| match_or_warn(value, "window-title overflow", TitleOverflow::parse))
+            .unwrap_or(defaults.overflow),
+    }
+}
+
+/// `max-chars` as a positive count. Unlike `margin`/`height` (which accept
+/// floats, since a logical pixel can sensibly be fractional) this is a count
+/// of characters, so only KDL integers qualify — and only positive ones: a
+/// `max-chars 0` would render every title as a bare `…`, and a negative one
+/// means nothing at all. Both warn and default, the same per-knob rule every
+/// other bad value gets.
+fn read_max_chars(block: &KdlDocument) -> Option<usize> {
+    let value = block.get_arg("max-chars")?;
+    match value.as_integer() {
+        // `i128` → `usize`: the guard is what makes the conversion sound
+        // (positive, and no larger than a title could ever be). Anything
+        // absurd is clamped rather than rejected — a `max-chars` of a billion
+        // is a strange config, not a broken one, and it simply never cuts.
+        Some(count) if count > 0 => Some(count.min(usize::MAX as i128) as usize),
+        _ => {
+            eprintln!(
+                "saola-panel: panel.kdl: window-title max-chars {value} is not a positive integer — using default"
+            );
+            None
+        }
+    }
+}
+
 /// Reads `colors { ink "#…"; paper "#…"; accent "#…" }`. Each of the three
 /// is independently optional — both "the whole `colors { }` block is
 /// absent" and "the block exists but only sets `accent`" leave the other
@@ -666,11 +1041,15 @@ mod tests {
                 margin 26
                 height 40
 
-                left   { mark; mpris }
+                left   { mark; window-title; mpris }
                 center { clock; niri-columns }
-                right  { volume; network; battery; claude; tray }
+                right  { volume; network; bluetooth; battery; claude; tray }
 
                 mark "builtin:notch"
+                launcher "wofi --show drun"
+                claude-icon "claude-code"
+
+                window-title { max-chars 24; overflow "marquee" }
 
                 colors { ink "#111111"; paper "#EEEEEE"; accent "#FF8800" }
             }
@@ -681,7 +1060,10 @@ mod tests {
         assert_eq!(config.edge, Edge::Bottom);
         assert_eq!(config.margin, Some(26.0));
         assert_eq!(config.height, Some(40.0));
-        assert_eq!(config.left, vec![ModuleName::Mark, ModuleName::Mpris]);
+        assert_eq!(
+            config.left,
+            vec![ModuleName::Mark, ModuleName::WindowTitle, ModuleName::Mpris]
+        );
         assert_eq!(
             config.center,
             vec![ModuleName::Clock, ModuleName::NiriColumns]
@@ -691,12 +1073,22 @@ mod tests {
             vec![
                 ModuleName::Volume,
                 ModuleName::Network,
+                ModuleName::Bluetooth,
                 ModuleName::Battery,
                 ModuleName::Claude,
                 ModuleName::Tray,
             ]
         );
         assert_eq!(config.mark, MarkSource::BuiltinNotch);
+        assert_eq!(config.launcher, Some("wofi --show drun".to_string()));
+        assert_eq!(config.claude_icon, ClaudeIcon::ClaudeCode);
+        assert_eq!(
+            config.window_title,
+            WindowTitleConfig {
+                max_chars: 24,
+                overflow: TitleOverflow::Marquee,
+            }
+        );
         assert_eq!(
             config.colors,
             ColorOverrides {
@@ -731,6 +1123,9 @@ mod tests {
         assert_eq!(config.center, PanelConfig::default().center);
         assert_eq!(config.right, PanelConfig::default().right);
         assert_eq!(config.mark, PanelConfig::default().mark);
+        assert_eq!(config.launcher, PanelConfig::default().launcher);
+        assert_eq!(config.claude_icon, PanelConfig::default().claude_icon);
+        assert_eq!(config.window_title, WindowTitleConfig::default());
         assert_eq!(config.colors.ink, None);
         assert_eq!(config.colors.paper, None);
     }
@@ -760,6 +1155,38 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         assert_eq!(config, PanelConfig::default());
+    }
+
+    /// The live-reload loader's three outcomes (see [`PanelConfig::
+    /// reload_from`]'s doc comment for why the malformed case differs from
+    /// boot): a valid file loads, a *deleted* file reverts to defaults, and
+    /// a malformed file answers `None` — "keep the running config" — rather
+    /// than flashing the panel back to the stock layout mid-edit.
+    #[test]
+    fn reload_keeps_the_running_config_on_a_malformed_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "saola-panel-test-reload-{}.kdl",
+            std::process::id()
+        ));
+
+        std::fs::write(&path, r#"panel { edge "bottom" }"#).unwrap();
+        let reloaded = PanelConfig::reload_from(&path).expect("a valid file must load");
+        assert_eq!(reloaded.edge, Edge::Bottom);
+
+        std::fs::write(&path, "panel { this is not } valid kdl {{{").unwrap();
+        assert_eq!(
+            PanelConfig::reload_from(&path),
+            None,
+            "a malformed file must keep the current config, not reset it"
+        );
+
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            PanelConfig::reload_from(&path),
+            Some(PanelConfig::default()),
+            "a deleted file is a real edit: revert to defaults"
+        );
     }
 
     /// A missing file is not an error at all — same defaults, no warning
@@ -814,6 +1241,10 @@ mod tests {
     #[test]
     fn module_list_maps_names_to_module_name_variants() {
         assert_eq!(ModuleName::parse("mark"), Some(ModuleName::Mark));
+        assert_eq!(
+            ModuleName::parse("window-title"),
+            Some(ModuleName::WindowTitle)
+        );
         assert_eq!(ModuleName::parse("mpris"), Some(ModuleName::Mpris));
         assert_eq!(ModuleName::parse("clock"), Some(ModuleName::Clock));
         assert_eq!(
@@ -822,6 +1253,7 @@ mod tests {
         );
         assert_eq!(ModuleName::parse("volume"), Some(ModuleName::Volume));
         assert_eq!(ModuleName::parse("network"), Some(ModuleName::Network));
+        assert_eq!(ModuleName::parse("bluetooth"), Some(ModuleName::Bluetooth));
         assert_eq!(ModuleName::parse("battery"), Some(ModuleName::Battery));
         assert_eq!(ModuleName::parse("claude"), Some(ModuleName::Claude));
         assert_eq!(ModuleName::parse("tray"), Some(ModuleName::Tray));
@@ -848,6 +1280,110 @@ mod tests {
             Some(MarkSource::File(PathBuf::from("/etc/saola/mark.svg")))
         );
         assert_eq!(MarkSource::parse("bogus"), None);
+    }
+
+    /// `claude-icon`'s two wire forms, plus the resilience paths: absent →
+    /// the Anthropic default, and an unrecognized value → warned and
+    /// defaulted, same per-knob rule as every other closed-set directive.
+    #[test]
+    fn claude_icon_parses_both_forms_and_defaults_on_nonsense() {
+        assert_eq!(ClaudeIcon::parse("anthropic"), Some(ClaudeIcon::Anthropic));
+        assert_eq!(
+            ClaudeIcon::parse("claude-code"),
+            Some(ClaudeIcon::ClaudeCode)
+        );
+        assert_eq!(ClaudeIcon::parse("sparkle"), None);
+
+        let absent = PanelConfig::parse("panel {}").expect("well-formed KDL");
+        assert_eq!(absent.claude_icon, ClaudeIcon::Anthropic);
+
+        let typo = PanelConfig::parse(r#"panel { claude-icon "clod" }"#).expect("well-formed KDL");
+        assert_eq!(typo.claude_icon, ClaudeIcon::Anthropic);
+    }
+
+    /// `launcher`'s three shapes: absent → `DEFAULT_LAUNCHER`, `"none"` →
+    /// disabled, anything else → passed through verbatim as the command
+    /// line. Unlike `mark_source_parses_all_four_forms`, there is no
+    /// "unrecognized value" case to test — a launcher directive is a
+    /// free-form command line, not a closed set of named values.
+    #[test]
+    fn launcher_directive_parses_all_three_forms() {
+        let absent = PanelConfig::parse("panel {}").expect("well-formed KDL");
+        assert_eq!(absent.launcher, Some(DEFAULT_LAUNCHER.to_string()));
+
+        let disabled = PanelConfig::parse(r#"panel { launcher "none" }"#).expect("well-formed KDL");
+        assert_eq!(disabled.launcher, None);
+
+        let custom = PanelConfig::parse(r#"panel { launcher "wofi --show drun" }"#)
+            .expect("well-formed KDL");
+        assert_eq!(custom.launcher, Some("wofi --show drun".to_string()));
+    }
+
+    /// `window-title { }`'s two knobs, each independently optional — and an
+    /// absent block is exactly the same as an empty one, per the style
+    /// guide's defaults (50 characters, truncate).
+    #[test]
+    fn window_title_block_parses_both_knobs_independently() {
+        let absent = PanelConfig::parse("panel {}").expect("well-formed KDL");
+        assert_eq!(absent.window_title, WindowTitleConfig::default());
+        assert_eq!(absent.window_title.max_chars, DEFAULT_TITLE_MAX_CHARS);
+        assert_eq!(absent.window_title.overflow, TitleOverflow::Truncate);
+
+        let empty = PanelConfig::parse("panel { window-title { } }").expect("well-formed KDL");
+        assert_eq!(empty.window_title, WindowTitleConfig::default());
+
+        let only_chars =
+            PanelConfig::parse("panel { window-title { max-chars 12 } }").expect("well-formed KDL");
+        assert_eq!(only_chars.window_title.max_chars, 12);
+        assert_eq!(only_chars.window_title.overflow, TitleOverflow::Truncate);
+
+        let only_overflow = PanelConfig::parse(r#"panel { window-title { overflow "marquee" } }"#)
+            .expect("well-formed KDL");
+        assert_eq!(
+            only_overflow.window_title.max_chars,
+            DEFAULT_TITLE_MAX_CHARS
+        );
+        assert_eq!(only_overflow.window_title.overflow, TitleOverflow::Marquee);
+    }
+
+    /// Both overflow modes are recognized now (the marquee's *animation* is a
+    /// later step, but its config value is not), and anything else warns and
+    /// defaults.
+    #[test]
+    fn title_overflow_parses_both_modes_and_defaults_on_nonsense() {
+        assert_eq!(
+            TitleOverflow::parse("truncate"),
+            Some(TitleOverflow::Truncate)
+        );
+        assert_eq!(
+            TitleOverflow::parse("marquee"),
+            Some(TitleOverflow::Marquee)
+        );
+        assert_eq!(TitleOverflow::parse("scroll"), None);
+
+        let typo = PanelConfig::parse(r#"panel { window-title { overflow "scroll" } }"#)
+            .expect("well-formed KDL");
+        assert_eq!(typo.window_title.overflow, TitleOverflow::Truncate);
+    }
+
+    /// A `max-chars` that isn't a positive integer resets *that* knob only —
+    /// the sibling `overflow` in the same block still loads.
+    #[test]
+    fn a_nonsense_max_chars_falls_back_without_taking_the_block_down() {
+        for bad in ["0", "-5", "\"fifty\"", "12.5"] {
+            let kdl =
+                format!(r#"panel {{ window-title {{ max-chars {bad}; overflow "marquee" }} }}"#);
+            let config = PanelConfig::parse(&kdl).expect("well-formed KDL");
+            assert_eq!(
+                config.window_title.max_chars, DEFAULT_TITLE_MAX_CHARS,
+                "max-chars {bad} should have defaulted"
+            );
+            assert_eq!(
+                config.window_title.overflow,
+                TitleOverflow::Marquee,
+                "the sibling knob should survive max-chars {bad}"
+            );
+        }
     }
 
     /// `~/` expands against a given `$HOME`; an absolute path passes
@@ -943,7 +1479,7 @@ mod tests {
             CliOverrides::parse(["--islands"]),
             CliOverrides {
                 style: Some(PanelStyle::Islands),
-                edge: None,
+                ..CliOverrides::default()
             }
         );
         assert_eq!(
@@ -951,13 +1487,14 @@ mod tests {
             CliOverrides {
                 style: Some(PanelStyle::Ledger),
                 edge: Some(Edge::Bottom),
+                ..CliOverrides::default()
             }
         );
         assert_eq!(
             CliOverrides::parse(["--top"]),
             CliOverrides {
-                style: None,
                 edge: Some(Edge::Top),
+                ..CliOverrides::default()
             }
         );
         assert_eq!(
@@ -985,9 +1522,107 @@ mod tests {
             overrides,
             CliOverrides {
                 style: Some(PanelStyle::Islands),
-                edge: None,
+                ..CliOverrides::default()
             }
         );
+    }
+
+    /// `--config-dir`'s two spellings both land, alongside the other flags;
+    /// the value-less forms warn and are ignored rather than eating a flag
+    /// or crashing — the same resilience as every other argument.
+    #[test]
+    fn cli_config_dir_parses_both_forms_and_ignores_a_missing_value() {
+        assert_eq!(
+            CliOverrides::parse(["--config-dir", "/tmp/panel-test"]).config_dir,
+            Some(PathBuf::from("/tmp/panel-test"))
+        );
+        assert_eq!(
+            CliOverrides::parse(["--config-dir=/tmp/panel-test"]).config_dir,
+            Some(PathBuf::from("/tmp/panel-test"))
+        );
+        // The value is consumed by the flag, not mistaken for a stray
+        // argument — the sibling flags around it still apply.
+        let mixed = CliOverrides::parse(["--islands", "--config-dir", "/tmp/x", "--bottom"]);
+        assert_eq!(mixed.style, Some(PanelStyle::Islands));
+        assert_eq!(mixed.edge, Some(Edge::Bottom));
+        assert_eq!(mixed.config_dir, Some(PathBuf::from("/tmp/x")));
+
+        // Trailing `--config-dir` with nothing after it, and the empty
+        // `=` form: warned, ignored, nothing else disturbed.
+        assert_eq!(CliOverrides::parse(["--config-dir"]).config_dir, None);
+        let empty = CliOverrides::parse(["--config-dir=", "--top"]);
+        assert_eq!(empty.config_dir, None);
+        assert_eq!(empty.edge, Some(Edge::Top));
+
+        // A flag where the value should be is a forgotten value, not a
+        // directory named "--islands" — and the flag must not be swallowed
+        // with it.
+        let flag_eaten = CliOverrides::parse(["--config-dir", "--islands"]);
+        assert_eq!(flag_eaten.config_dir, None);
+        assert_eq!(
+            flag_eaten.style,
+            Some(PanelStyle::Islands),
+            "the flag following a value-less --config-dir must still apply"
+        );
+
+        // An empty string as the two-token value is as unusable as
+        // `--config-dir=`.
+        assert_eq!(
+            CliOverrides::parse(["--config-dir", ""]).config_dir,
+            None,
+            "an empty value must not resolve to a cwd-relative panel.kdl"
+        );
+    }
+
+    /// The directory resolution chain, rung by rung: the flag beats
+    /// `$SAOLA_CONFIG_DIR` beats `$XDG_CONFIG_HOME/saola` beats
+    /// `~/.config/saola` beats nothing. Exercises `config_dir_from`
+    /// directly (env values as arguments) for the same no-races reason as
+    /// `tilde_expands_against_a_given_home`.
+    #[test]
+    fn config_dir_resolves_most_specific_first() {
+        let cli = Some(Path::new("/cli/dir"));
+        let saola = || Some(std::ffi::OsString::from("/saola/dir"));
+        let xdg = || Some(std::ffi::OsString::from("/xdg"));
+        let home = || Some(std::ffi::OsString::from("/home/test-user"));
+
+        assert_eq!(
+            config_dir_from(cli, saola(), xdg(), home()),
+            Some(PathBuf::from("/cli/dir")),
+            "the flag beats everything"
+        );
+        assert_eq!(
+            config_dir_from(None, saola(), xdg(), home()),
+            Some(PathBuf::from("/saola/dir")),
+            "$SAOLA_CONFIG_DIR beats the XDG chain"
+        );
+        assert_eq!(
+            config_dir_from(None, None, xdg(), home()),
+            Some(PathBuf::from("/xdg/saola")),
+            "$XDG_CONFIG_HOME gets the saola/ namespace joined on"
+        );
+        assert_eq!(
+            config_dir_from(None, None, None, home()),
+            Some(PathBuf::from("/home/test-user/.config/saola")),
+            "the spec's ~/.config fallback"
+        );
+        assert_eq!(config_dir_from(None, None, None, None), None);
+    }
+
+    /// An env var set to the empty string is unset, per the XDG spec's own
+    /// rule — it falls through to the next rung, it doesn't name "". That
+    /// includes `$HOME` itself: an empty `HOME` resolves to *no* config
+    /// path, never to the cwd-relative `.config/saola`.
+    #[test]
+    fn empty_env_vars_fall_through_the_chain() {
+        let empty = || Some(std::ffi::OsString::new());
+        let home = Some(std::ffi::OsString::from("/home/test-user"));
+
+        assert_eq!(
+            config_dir_from(None, empty(), empty(), home),
+            Some(PathBuf::from("/home/test-user/.config/saola"))
+        );
+        assert_eq!(config_dir_from(None, empty(), empty(), empty()), None);
     }
 
     /// `apply` overwrites exactly the fields a flag set — a config whose

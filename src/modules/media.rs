@@ -1,4 +1,4 @@
-//! The bar's now-playing pill, fed by MPRIS over D-Bus.
+//! The bar's now-playing status glyph, fed by MPRIS over D-Bus.
 //!
 //! Teaching note (session bus vs. system bus): battery (UPower) and network
 //! (iwd) are both **system** services — one UPower/iwd process serves every
@@ -29,25 +29,47 @@
 //! unified event stream instead of hand-rolling a `tokio::select!` over an
 //! unknown number of branches.
 //!
-//! Per CLAUDE.md's one rule ("at most one terracotta element per surface"),
-//! the pill itself is always the quiet [`style::button::muted`] fill — never
-//! a solid terracotta flood, even while playing. The *play glyph* is this
-//! pill's one terracotta accent: solid `palette.accent` while the active
-//! player's `PlaybackStatus` is `Playing`, `on_ink.secondary` (a quiet status
-//! light, not a second color) while `Paused`. No players (or none whose
-//! status counts as a candidate — see [`pick_active_player`]) renders
-//! nothing, same contract as `Battery`/`Network` with no service present.
+//! # Design language (2026-08-01: media becomes a status glyph)
+//!
+//! Style guide §7, "Media is a status glyph": now-playing moved out of the
+//! bar's left region entirely and into the status cluster, where it renders
+//! as one more bare glyph beside `volume`/`battery` — no pill, no title
+//! text, no fill of its own, and (unlike `clock`/`mark`) no per-style
+//! surface treatment either, since a bare glyph looks the same directly on
+//! the ledger bar's ink or inside an island's shared status pill; `view`
+//! no longer takes `PanelStyle` at all.
+//!
+//! [`Media::view`] draws nothing when [`pick_active_player`] has no
+//! candidate — the same "renders nothing" contract as `Battery`/`Network`
+//! with no service present — and otherwise a single solid `Icon::Play`
+//! glyph. CLAUDE.md's element-scale terracotta rule, in its bare-status
+//! form, colors it `palette.accent` while the shown player's
+//! `PlaybackStatus` is `Playing`, and the ordinary `on_ink.primary` ivory
+//! while `Paused` — see [`Media::view`]'s own doc comment for why the raw
+//! `accent` token is right here where `battery.rs`'s charging glyph needs
+//! the higher-luminance `accent_light` instead. The glyph never swaps shape
+//! (no `Icon::Pause` the way the old transport pill's icon did): it's a
+//! readout now, not a control that tells you what pressing it will do, and
+//! it carries no `on_press` of its own, so a click passes through to the
+//! status cluster's shared trigger exactly like every glyph beside it.
+//!
+//! Title, artist, and the transport buttons all live in the quick-settings
+//! media row (`popovers::quick_settings::media_row`) — unaffected by this
+//! change, and still reading [`Media::now_playing`] directly. This retires
+//! the bar's one subtle-fill pill: in ledger style the clock is now the
+//! bar's only pill, full stop.
 //!
 //! # The command-out pattern (Stage 17, the project's first)
 //!
 //! Everything above is **command-in**: the worker reads MPRIS state and
 //! pushes snapshots, and nothing here ever calls a method that changes
-//! anything. The bar pill's own click and the quick-settings transport row
-//! (`popovers::quick_settings::media_row`) are the panel's first
-//! *command-out* D-Bus calls, and the shape is deliberately not another
-//! long-lived worker: [`play_pause`]/[`next`]/[`previous`] each open a
-//! **fresh, one-shot session-bus connection**, make one method call, and let
-//! the connection drop. `Task::future(..).discard()` is what expresses "run
+//! anything. The quick-settings transport row
+//! (`popovers::quick_settings::media_row`) — the bar glyph itself has no
+//! transport control of its own, see "Design language" above — is the
+//! panel's first *command-out* D-Bus caller, and the shape is deliberately
+//! not another long-lived worker: [`play_pause`]/[`next`]/[`previous`] each
+//! open a **fresh, one-shot session-bus connection**, make one method call,
+//! and let the connection drop. `Task::future(..).discard()` is what expresses "run
 //! this to completion, I don't need the result" — `Panel::update` has
 //! nothing useful to do with success/failure beyond the `eprintln!` already
 //! inside [`send_player_command`].
@@ -67,11 +89,10 @@ use std::collections::HashMap;
 use iced::futures::channel::mpsc;
 use iced::futures::stream::{self, BoxStream, StreamExt};
 use iced::futures::{SinkExt, Stream};
-use iced::widget::text::Wrapping;
-use iced::widget::{button, container, row, text, Space};
-use iced::{Element, Fill, Subscription, Task};
+use iced::widget::Space;
+use iced::{Element, Subscription, Task};
 use saola_theme::convert::ColorExt;
-use saola_theme::{style, Surface, Theme};
+use saola_theme::Theme;
 use zbus::fdo::DBusProxy;
 use zbus::zvariant::OwnedValue;
 use zbus::Connection;
@@ -86,12 +107,13 @@ use crate::icons::{self, Icon};
 #[derive(Debug, Clone)]
 pub enum Message {
     Updated(Media),
-    /// A transport button (bar pill or quick-settings media row) was
-    /// clicked. Each carries the *target* player's bus name, read off
-    /// `NowPlaying::bus_name` at the moment the button was drawn — see the
-    /// module doc comment's "command-out pattern" section for why this
-    /// resolves to a fresh one-shot connection rather than reaching into
-    /// the worker's own proxy.
+    /// A quick-settings media row transport button was clicked (the bar
+    /// glyph itself has no transport control of its own — see the module
+    /// doc comment's "Design language" section). Each carries the *target*
+    /// player's bus name, read off `NowPlaying::bus_name` at the moment the
+    /// button was drawn — see the module doc comment's "command-out
+    /// pattern" section for why this resolves to a fresh one-shot
+    /// connection rather than reaching into the worker's own proxy.
     PlayPause(String),
     Next(String),
     Previous(String),
@@ -164,9 +186,11 @@ pub struct Media {
     now_playing: Option<NowPlaying>,
 }
 
-/// The one player the pill is currently showing, already reduced from
-/// however many MPRIS players are running to "here's the label and
-/// whether it's live" — `view` never sees the raw player set, only this.
+/// The one player the status glyph and the quick-settings media row are
+/// currently showing, already reduced from however many MPRIS players are
+/// running to "here's the label and whether it's live" — `view` only reads
+/// [`Self::playing`] and [`Self::bus_name`] of this; the popover row is what
+/// uses the rest.
 ///
 /// `pub(crate)`, not private: `popovers::quick_settings::media_row` (Stage
 /// 17) reads this through [`Media::now_playing`] to lay out its own,
@@ -186,13 +210,9 @@ pub(crate) struct NowPlaying {
 }
 
 impl NowPlaying {
-    fn label(&self) -> String {
-        media_label(&self.title, &self.artist)
-    }
-
-    /// The bare track title — `Self::label` already joins this with the
-    /// artist for the bar's one-line pill; the quick-settings media row has
-    /// room for both on their own line, so it reads them separately.
+    /// The bare track title — the quick-settings media row's own line;
+    /// the bar's status glyph shows neither this nor [`Self::artist`] (see
+    /// the module doc comment's "Design language" section).
     pub(crate) fn title(&self) -> &str {
         &self.title
     }
@@ -215,19 +235,6 @@ impl NowPlaying {
 }
 
 impl Media {
-    /// Renders the media pill, or nothing when there's no candidate
-    /// player (see [`pick_active_player`]).
-    ///
-    /// A `button` with a `row![icon, text]` as its content, since this pill
-    /// shows a play glyph *and* a label. There's only one pill style here,
-    /// `muted` — see the module doc comment for why a solid-fill state was
-    /// removed. As of Stage 17 the button has a real `on_press`
-    /// ([`Message::PlayPause`]) — before that, with no press handler at
-    /// all, iced always reported `Status::Disabled`, so the style closure
-    /// had to pin the status to `Active` to keep the pill from looking
-    /// grayed out (`battery.rs`'s pill still does, having no click of its
-    /// own); that workaround is gone here now that a real status exists to
-    /// report.
     /// Whether this module would draw anything right now — the presence
     /// question `Panel::island_view` asks before spending an island pill on
     /// a module. Asks the same `Option` as `view`'s `let-else`, so the two
@@ -236,8 +243,8 @@ impl Media {
         self.now_playing.is_some()
     }
 
-    /// The player the pill/quick-settings media row is currently showing,
-    /// or `None` when nothing counts as a candidate (see
+    /// The player the status glyph and the quick-settings media row are
+    /// currently showing, or `None` when nothing counts as a candidate (see
     /// [`pick_active_player`]). `pub(crate)` so
     /// `popovers::quick_settings::media_row` can read the same state this
     /// module's own `view` renders, rather than a second copy.
@@ -245,95 +252,42 @@ impl Media {
         self.now_playing.as_ref()
     }
 
+    /// Renders the status glyph, or nothing at all when there's no
+    /// candidate player (see [`pick_active_player`]) — the same
+    /// "renders nothing" contract every other status module gives an
+    /// absent service.
+    ///
+    /// One bare `Icon::Play` glyph, exactly like `battery`/`volume`'s bare
+    /// status icons: no button, no pill, no `on_press`. The glyph never
+    /// swaps to `Icon::Pause` the way the old transport pill's did — this
+    /// is a readout, not a control that previews what a click will do, so
+    /// only its *color* carries the state: `palette.accent` (this module's
+    /// one live, element-scale terracotta accent, per CLAUDE.md) while the
+    /// shown player's `PlaybackStatus` is `Playing`, the ordinary
+    /// `on_ink.primary` ivory while `Paused`.
+    ///
+    /// Raw `accent`, not `accent_light`: `battery.rs`'s charging glyph
+    /// needs the higher-luminance `accent_light` token because it's drawn
+    /// with a *stroke* (`#C67139` text/strokes on ink fail contrast, per
+    /// the style guide's accent ramp) — but `Icon::Play` is a solid
+    /// *filled* shape, the same class of thing as a pill's fill, where the
+    /// style guide's own §1 table already pairs raw `#C67139` with ivory
+    /// content directly.
+    ///
+    /// No button wrapping the glyph is what makes it a readout rather than
+    /// a control: a bare `Svg` widget doesn't capture the click, so it
+    /// falls through to whatever wraps the status cluster
+    /// (`main.rs::Panel::status_cluster_trigger`'s "child updates first"
+    /// note), opening quick settings exactly like clicking any other bare
+    /// status icon beside it.
     pub fn view(&self, theme: &Theme) -> Element<'_, Message> {
         let Some(now_playing) = &self.now_playing else {
             return Space::new().into();
         };
 
-        let playing = now_playing.playing;
-        let pill_style = style::button::muted(theme, Surface::Ink);
+        let color = glyph_color(theme, now_playing.playing).into_iced();
 
-        // The glyph is this pill's one terracotta accent: solid
-        // `palette.accent` while `Playing` (the pill's one live element),
-        // `on_ink.secondary` while `Paused` (a quiet status light, same
-        // treatment as any other at-rest label on ink) — unchanged since
-        // before Stage 17. What *did* change: the shape now varies with
-        // `playing` too (`Pause` while playing, `Play` while paused), the
-        // usual "icon shows what a click will do" convention, now that a
-        // click actually does something (see `.on_press` below).
-        let icon_color = if playing {
-            theme.palette.accent
-        } else {
-            theme.on_ink.secondary
-        }
-        .into_iced();
-        let icon_kind = if playing { Icon::Pause } else { Icon::Play };
-
-        // The label sets its own color explicitly (`.color(...)` below)
-        // rather than taking `muted`'s default: that default is
-        // `on_ink.secondary` (a deliberately quiet role, right for its usual
-        // off/idle uses), but the concept for *this* pill wants a
-        // full-ivory label even though the pill fill itself is quiet — same
-        // reasoning as the icon above (a separate `Svg` widget that never
-        // inherits a button's `text_color`).
-        //
-        // The title is also the one place on the bar that uses
-        // `ui_font_regular` (weight 400) instead of the bar's usual default
-        // (`ui_font`, weight 500, applied automatically by the theme's text
-        // styles elsewhere) — the concept mockup specifically draws the
-        // media title lighter than every other bar label.
-        let title = text(now_playing.label())
-            .size(theme.typography.size.bar)
-            .font(saola_theme::convert::ui_font_regular(theme))
-            // A long track title must not stretch this pill across the bar,
-            // so it's capped to `media_title_max_width` (the *text's* cap —
-            // `pill_max_width` is the separate, larger cap on the whole
-            // pill) and forced onto one line: `Wrapping::None` stops iced
-            // from word-wrapping into a second line once the container
-            // below constrains its width. iced 0.14 has no text-ellipsis
-            // option (`iced::widget::text::Wrapping` is only
-            // `None`/`Word`/`Glyph`/`WordOrGlyph` — no "…"-truncate
-            // variant), so clipping the overflow via the container's
-            // `.clip(true)` is the honest approximation until iced grows a
-            // real ellipsis.
-            .wrapping(Wrapping::None)
-            .color(theme.on_ink.primary.into_iced());
-        let title = container(title)
-            .max_width(theme.sizes.media_title_max_width)
-            .clip(true)
-            .height(Fill)
-            .align_y(iced::Center);
-
-        button(
-            row![
-                icons::icon(icon_kind, theme.sizes.icon_bar, icon_color),
-                title,
-            ]
-            // Icon-to-label gap inside the pill: `pill_gap`, not
-            // `island_gap` (the gap *between* adjacent bar pills — a
-            // previous pass reused it here for lack of a dedicated token,
-            // before `pill_gap` landed in saola-theme).
-            .spacing(theme.sizes.pill_gap)
-            .align_y(iced::Center),
-        )
-        // `panel_pill_media` (30) is the compact in-bar pill height the
-        // concept sketch draws for this pill — smaller than the
-        // general-purpose `panel_pill` (40), which is the free-standing
-        // islands-mode/popover scale. Same halved-height horizontal padding
-        // convention as every other bar pill (half the height becomes the
-        // end-cap radius).
-        .height(theme.sizes.panel_pill_media)
-        .padding([0.0, theme.sizes.panel_pill_media / 2.0])
-        .style(pill_style)
-        // Real as of Stage 17: a click toggles playback on the active
-        // player. Before this the button had no `on_press` at all, so iced
-        // always reported `Status::Disabled`, and the style closure above
-        // used to pin the status to `Active` to work around that (see
-        // `battery.rs`'s pill for the same trick, still needed there). With
-        // a real `on_press`, `pill_style` now sees every status honestly —
-        // `muted`'s Hovered/Pressed steps show for the first time.
-        .on_press(Message::PlayPause(now_playing.bus_name.clone()))
-        .into()
+        icons::icon(Icon::Play, theme.sizes.icon_bar, color).into()
     }
 
     /// The MPRIS D-Bus feed as an iced subscription. See `battery.rs`'s
@@ -344,17 +298,20 @@ impl Media {
     }
 }
 
-/// "title — artist" pill label. Falls back to whichever side is non-empty
-/// when a player only ever sets one `xesam:*` field, rather than showing a
-/// bare "— " separator; empty when neither is known yet.
+/// Which color the status glyph takes — this module's one live terracotta
+/// accent while the shown player is playing, the ordinary ivory role while
+/// paused. See [`Media::view`]'s doc comment for why the raw `accent` token
+/// (not `accent_light`) is the right one for a *filled* glyph.
 ///
-/// Pure function, unit-tested below.
-fn media_label(title: &str, artist: &str) -> String {
-    match (title.is_empty(), artist.is_empty()) {
-        (false, false) => format!("{title} — {artist}"),
-        (false, true) => title.to_string(),
-        (true, false) => artist.to_string(),
-        (true, true) => String::new(),
+/// Pure function of its arguments, unit-tested below — `view` only wires
+/// this into the rendered `Svg`, the same "logic here, wiring there" split
+/// `battery_icon`/`wifi_icon` use for their own leveled glyphs (this one
+/// just has two states to pick between, not a ladder).
+fn glyph_color(theme: &Theme, playing: bool) -> saola_theme::tokens::Color {
+    if playing {
+        theme.palette.accent
+    } else {
+        theme.on_ink.primary
     }
 }
 
@@ -906,18 +863,6 @@ mod tests {
         assert!(pick_active_player(&[]).is_none());
     }
 
-    #[test]
-    fn label_joins_title_and_artist_with_an_em_dash() {
-        assert_eq!(media_label("Song", "Artist"), "Song — Artist");
-    }
-
-    #[test]
-    fn label_falls_back_to_whichever_side_is_known() {
-        assert_eq!(media_label("Song", ""), "Song");
-        assert_eq!(media_label("", "Artist"), "Artist");
-        assert_eq!(media_label("", ""), "");
-    }
-
     /// Stage 17: a transport click needs to know *which* player to target,
     /// so `bus_name` has to survive the trip from a raw `PlayerSnapshot`
     /// through `pick_active_player` and into the `NowPlaying` `send_active`
@@ -947,5 +892,53 @@ mod tests {
         assert_eq!(now_playing.artist(), "Artist");
         assert!(now_playing.playing());
         assert_eq!(now_playing.bus_name(), "org.mpris.MediaPlayer2.vlc");
+    }
+
+    /// The status glyph's one live accent, per CLAUDE.md's element-scale
+    /// terracotta rule: playing is terracotta, paused is the ordinary ivory
+    /// role — see `glyph_color`'s doc comment for why it's the raw `accent`
+    /// token rather than `accent_light`.
+    #[test]
+    fn glyph_is_terracotta_while_playing() {
+        let theme = Theme::saola();
+        assert_eq!(glyph_color(&theme, true), theme.palette.accent);
+    }
+
+    #[test]
+    fn glyph_is_ivory_while_paused() {
+        let theme = Theme::saola();
+        assert_eq!(glyph_color(&theme, false), theme.on_ink.primary);
+    }
+
+    /// `view` renders nothing (a zero-sized `Space`) when there's no
+    /// candidate player — same "renders nothing" contract as
+    /// `Battery`/`Network` with no service present. `Element` can't be
+    /// introspected, so this only pins "doesn't panic"; the absent-glyph
+    /// *decision* itself is `Media::is_present`/`Option`-based and already
+    /// covered by `pick_active_player`'s own tests above.
+    #[test]
+    fn view_renders_nothing_without_panicking_when_no_player_is_present() {
+        let theme = Theme::saola();
+        let media = Media::default();
+        assert!(!media.is_present());
+        let _: Element<'_, Message> = media.view(&theme);
+    }
+
+    /// `view` also renders without panicking once a player is present,
+    /// exercising the `Some` arm of `view`'s `let-else` (the `None` arm is
+    /// the test just above).
+    #[test]
+    fn view_renders_without_panicking_when_a_player_is_present() {
+        let theme = Theme::saola();
+        let media = Media {
+            now_playing: Some(NowPlaying {
+                title: "Title".to_string(),
+                artist: "Artist".to_string(),
+                playing: true,
+                bus_name: "org.mpris.MediaPlayer2.vlc".to_string(),
+            }),
+        };
+        assert!(media.is_present());
+        let _: Element<'_, Message> = media.view(&theme);
     }
 }

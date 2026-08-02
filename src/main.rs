@@ -59,29 +59,33 @@
 //! # Stage 15: two layouts, one seam
 //!
 //! `style "islands"` in `panel.kdl` swaps the single ledger bar for the
-//! spec's default panel style: **three** free-standing translucent pill
-//! clusters floating over the wallpaper, each one its own layer-shell
-//! surface (spec §7 lists *four* — the notifications island is excluded from
-//! this phase; see [`IslandKind`]). The switch is config-only: both layouts
-//! compose the very same [`Panel::module_view`] / [`Panel::region`] pieces
-//! and differ only in the outer widget tree ([`Panel::bar_view`] vs
-//! [`Panel::island_view`]) and in the layer-shell geometry
-//! ([`SurfaceGeometry::of`]) — no module lays itself out.
+//! spec's default panel style: **three** free-standing solid-ink pill
+//! clusters floating over the wallpaper — since 2026-08-01 all drawn on
+//! **one** full-width layer-shell surface, the islands strip, as stacked
+//! layers ([`Panel::islands_view`]; see [`IslandKind`] for why the
+//! original surface-per-cluster design collapsed into one, and for the
+//! spec-§7 notifications slot excluded from this phase). The switch is
+//! config-only: both layouts compose the very same [`Panel::module_view`]
+//! / [`Panel::region`] pieces and differ only in the outer widget tree
+//! ([`Panel::bar_view`] vs [`Panel::islands_view`]) and in the layer-shell
+//! geometry ([`SurfaceGeometry::of`]) — no module lays itself out.
 //!
 //! The one thing a module *may* know about the style is its own **surface
-//! treatment**, which [`modules::clock`] is so far the only module to use (an
-//! ivory pill on the ledger bar, bare text on an island scrim). That is an
+//! treatment** — clock and mark use it today (e.g. the clock: an
+//! ivory pill on the ledger bar, bare text on an island). That is an
 //! amendment to Stage 15's original flat seam rule, made deliberately — the
 //! reasoning is in [`Panel::island_view`]'s doc comment.
 //!
 //! Two things about the surfaces are worth reading before touching them:
 //!
-//! * **Every surface is full-width and mostly transparent.** An island's
-//!   surface spans the whole output (inset by the margin); the scrim pill
-//!   inside it hugs its content and is aligned left / centre / right. Nothing
-//!   measures text, so nothing has to resize a surface when the clock ticks
-//!   or a song changes. What pays for that is `events_transparent` — see
-//!   [`SurfaceGeometry`].
+//! * **Every surface is full-width and mostly transparent.** The islands
+//!   strip spans the whole output (inset by the margin); each cluster's
+//!   pills hug their content and are aligned left / centre / right by
+//!   their stack layer. Nothing measures text, so nothing has to resize a
+//!   surface when the clock ticks or a song changes. The strip takes
+//!   pointer input across that whole width, like the ledger bar — see
+//!   [`SurfaceGeometry`]'s `events_transparent` field for what the empty
+//!   space swallows and why that's acceptable.
 //! * **The app-wide background is transparent** (see [`Panel::style`]), which
 //!   is what lets the wallpaper show between the islands — and, incidentally,
 //!   what finally makes the *ledger* bar's rounded ends visible.
@@ -106,23 +110,25 @@
 //!   Both used to be hardcoded (`Top` / `None`) at the two places a surface
 //!   is created; a popover needs `Overlay` / `OnDemand`, so they joined the
 //!   rest of the per-surface geometry instead.
-//! * **The right island stopped being click-through.** `events_transparent`
-//!   is fixed at surface-creation time and is all-or-nothing (see that
-//!   field), so the island that carries the trigger has to take input for its
-//!   whole full-width strip. The other two islands stay click-through, which
-//!   is what stops them swallowing the trigger's clicks even though all three
-//!   surfaces overlap.
+//! * **The islands' input model became the ledger's.** Stage 16 originally
+//!   let only the right of the three per-cluster surfaces take input
+//!   (`events_transparent` is all-or-nothing per surface, and overlapping
+//!   full-width input regions would have fought over the pointer) — which
+//!   later left the mark and media clusters unclickable, and is the story
+//!   of why the three surfaces became one strip (see [`IslandKind`]).
 
 mod config;
+mod config_watch;
 mod icons;
 mod modules;
 mod popover;
 mod popovers;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use iced::alignment::Horizontal;
-use iced::widget::{container, mouse_area, row, Space};
+use iced::widget::{button, container, row, stack, Space};
 use iced::window;
 use iced::{Element, Fill, Subscription, Task};
 use iced_layershell::build_pattern::daemon;
@@ -138,18 +144,36 @@ use modules::media::Media;
 use modules::network::Network;
 use modules::tray::Tray;
 use modules::volume::Volume;
+use modules::window_title::WindowTitle;
 use popover::{PopoverKind, PopoverManager};
-use saola_theme::{style, to_iced_theme, Theme};
+use saola_theme::{style, to_iced_theme, Surface, Theme};
 
 fn main() -> iced_layershell::Result {
-    // Loaded once, here, before iced's event loop exists at all — see
-    // `config`'s module doc comment for the full resilience contract
-    // (absent/malformed file → today's hardcoded layout, never a crash).
-    // Command-line flags (`--ledger`/`--islands`, `--top`/`--bottom`) then
+    // Loaded here, before iced's event loop exists at all — see `config`'s
+    // module doc comment for the full resilience contract (absent/malformed
+    // file → today's hardcoded layout, never a crash). Command-line flags
+    // (`--ledger`/`--islands`, `--top`/`--bottom`, `--config-dir`) then
     // override the file — a testing convenience, so switching modes doesn't
-    // require editing `panel.kdl` (see `config::CliOverrides`).
-    let mut config = config::PanelConfig::load();
-    config::CliOverrides::parse(std::env::args().skip(1)).apply(&mut config);
+    // require editing `panel.kdl` (see `config::CliOverrides`). The flags
+    // are parsed into a value of their own (rather than applied and
+    // forgotten) because the config is no longer read exactly once:
+    // `config_watch` re-reads `panel.kdl` whenever it changes on disk, and
+    // the reload arm in `Panel::update` needs the boot flags in hand to
+    // keep them winning over the file on every reload, not just the first
+    // read.
+    //
+    // The *path* is resolved exactly once, here, and threaded to both of
+    // its consumers — the boot load below and the `config_watch`
+    // subscription (via `Panel`) — so the loader and the watcher cannot
+    // disagree about which file is the config. `--config-dir` heads the
+    // resolution chain (then `$SAOLA_CONFIG_DIR`, then XDG — see
+    // `config::PanelConfig::resolve_path`), which is why the flags must be
+    // parsed *before* the load, unlike the style/edge overrides applied
+    // after it: this flag decides where the config is, not what's in it.
+    let cli = config::CliOverrides::parse(std::env::args().skip(1));
+    let config_path = config::PanelConfig::resolve_path(cli.config_dir.as_deref());
+    let mut config = config::PanelConfig::load(config_path.as_deref());
+    cli.apply(&mut config);
 
     // A separate Theme instance just for the values `main` needs before the
     // application starts (bar height, default font) — `Panel` gets its own
@@ -161,13 +185,12 @@ fn main() -> iced_layershell::Result {
     let mut theme = Theme::saola();
     config.colors.apply(&mut theme.palette);
 
-    // The one surface `Settings` creates at boot is the ledger bar in ledger
-    // style and the **centre island** in islands style (see `initial_role`
-    // for why reshaping it beats spawning a fourth surface and closing this
-    // one). Every number the layer-shell protocol needs — anchor, size,
-    // margins, exclusive zone, input transparency — is derived from tokens
-    // and config in one place, `SurfaceGeometry::of`, so `main` and
-    // `Panel::spawn_boot_surfaces` cannot drift apart.
+    // The one surface `Settings` creates at boot is the whole panel: the
+    // ledger bar in ledger style, the islands strip in islands style (see
+    // `initial_role`). Every number the layer-shell protocol needs —
+    // anchor, size, margins, exclusive zone, input transparency — is
+    // derived from tokens and config in one place, `SurfaceGeometry::of`,
+    // so `main` and `Panel::spawn_boot_surfaces` cannot drift apart.
     let initial = SurfaceGeometry::of(initial_role(&config), &config, &theme);
 
     // Computed *before* the `daemon(move || ..)` call below, which moves
@@ -211,7 +234,18 @@ fn main() -> iced_layershell::Result {
     // starts, without needing a "have I spawned them yet?" flag on `Panel`
     // or a first-frame hook. See `Panel::spawn_boot_surfaces`.
     daemon(
-        move || Panel::new(config.clone(), theme.clone()).boot(),
+        // `cli` and `config_path` ride along as clones so the reload arm
+        // can re-apply the boot flags and the watcher can follow the
+        // resolved path — see the comment where they were derived above.
+        move || {
+            Panel::new(
+                config.clone(),
+                cli.clone(),
+                config_path.clone(),
+                theme.clone(),
+            )
+            .boot()
+        },
         "saola-panel",
         Panel::update,
         Panel::view,
@@ -336,34 +370,27 @@ impl SurfaceGeometry {
     /// # The exclusive-zone arithmetic (measured, not assumed)
     ///
     /// The zone is the number of pixels the compositor keeps clear along the
-    /// anchored edge. We pass **just the surface height**, never height +
-    /// margin, because wlr-layer-shell compositors add the anchored-edge
-    /// margin to the reserved area themselves. Measured on niri while
-    /// writing this stage: with the ledger bar's `exclusive_zone = 48` and
-    /// `margin.top = 18`, a maximized window's tile height dropped by
-    /// **exactly 66 px** (1003.33 → 937.33) when the panel started — i.e.
-    /// 48 + 18, the margin counted once. Islands reserve the same 66 px from
-    /// the other direction: `panel_pill` 40 + `panel_margin_islands` 26.
+    /// anchored edge. wlr-layer-shell compositors add the anchored-edge
+    /// margin to the reserved area themselves (measured on niri while
+    /// writing Stage 15: with `exclusive_zone = 48` and `margin.top = 18`, a
+    /// maximized window's tile height dropped by exactly 66 px — 48 + 18,
+    /// the margin counted once). As of 2026-08-01 the zone we pass is
+    /// **height + one edge margin**: the extra margin is a bottom gap, so
+    /// tiled windows keep the same breathing room below the panel as the
+    /// top margin gives it above (Jordan's ask). Total reserved strip =
+    /// zone + margin = height + 2 × edge margin: 84 for the ledger bar
+    /// (48+18+18), 76 for the islands strip (40+18+18).
     ///
-    /// **Only the centre island reserves anything.** The left and right
-    /// islands pass `0` — reserve nothing, respect everyone's reservations —
-    /// and compensate with a **negative** edge margin (revised while fixing
-    /// the popover's waybar bug; they originally passed `-1`, "do not move me
-    /// out of anyone else's zone", so that the compositor could not push them
-    /// below the centre island's own 66 px reservation). `-1` had the same
-    /// flaw as the original popover: it measures from the raw screen edge,
-    /// so any *foreign* bar with an exclusive zone (waybar, on Jordan's
-    /// desktop) pushed the centre island down but not its siblings, tearing
-    /// the three islands apart. With `0`, a zone-respecting surface is
-    /// placed below the centre's reservation (`panel_pill` 40 +
-    /// `panel_margin_islands` 26 = 66), which is 40 px *lower* than the
-    /// strip the sibling islands should share — so their edge margin is
-    /// `island margin − strip` = `26 − 66` = **−40** (negative margins are
-    /// legal i32s in wlr-layer-shell), pulling them back up level with the
-    /// centre. One formula for every non-reserving surface: *edge margin =
-    /// desired offset from the panel's baseline − the strip the panel
-    /// reserves*; the popover's `popover_top − strip` below is the same
-    /// arithmetic with a different desired offset.
+    /// Both panel surfaces reserve their own strip — with the islands a
+    /// single surface (2026-08-01, see `IslandKind`'s doc comment for the
+    /// history), there is no non-reserving sibling left to re-level. (The
+    /// retired mechanics, kept here as the formula the popover still uses:
+    /// a zone-respecting surface passing `0` — reserve nothing, respect
+    /// everyone's reservations, `-1` would measure from the raw screen
+    /// edge and break next to a foreign bar like waybar — is placed below
+    /// the panel's reservation, so *edge margin = desired offset from the
+    /// panel's baseline − the strip the panel reserves*; the popover's
+    /// `popover_top − strip` below is exactly that arithmetic.)
     ///
     /// # The popover's anchor math (Stage 16, corrected)
     ///
@@ -378,9 +405,12 @@ impl SurfaceGeometry {
     /// reservation on the output. Its edge margin is therefore not
     /// `popover_top` itself but the **gap**: `popover_top` minus the strip
     /// the panel reserves (exclusive zone + anchored-edge margin — wlr
-    /// compositors add the margin to the reservation). That strip is 66 in
-    /// both styles (48 + 18 ledger, 40 + 26 islands), so the gap is
-    /// `72 − 66 = 6` px and the popover lands on exactly the spec's pixel.
+    /// compositors add the margin to the reservation). Since the bottom-gap
+    /// change (2026-08-01) that strip already exceeds `popover_top` — 84 in
+    /// ledger style (48+18+18), 76 in islands (40+18+18) — so the gap
+    /// clamps to 0 and the popover sits flush against the reserved strip,
+    /// i.e. exactly one edge margin (18) below the panel's bottom edge: the
+    /// same breathing room tiled windows now get.
     ///
     /// The strip is read back from the panel's own [`SurfaceGeometry`]
     /// (via [`initial_role`]) rather than re-derived from tokens, so a
@@ -398,14 +428,13 @@ impl SurfaceGeometry {
     /// surfaces measure from the same baseline, so they move together under
     /// any neighbour.
     ///
-    /// The side inset is `config.margin(theme)`, not a literal 26. That
-    /// **is** 26 in islands style (`panel_margin_islands`, the style the spec
-    /// describes), and in ledger style it is 20 — which lines the popover's
-    /// right edge up with the end of the bar it hangs from rather than
-    /// leaving it 6 px proud. It also means a user who moves the panel with
-    /// `margin` in `panel.kdl` moves the popover with it. (If saola-theme
-    /// ever grows a dedicated `popover_margin` token, this is the line to
-    /// change.)
+    /// The side inset is `config.margin(theme)` — `panel_margin_ledger`
+    /// (20) in both styles since the islands margins were matched to the
+    /// ledger's — which lines the popover's right edge up with the end of
+    /// the panel it hangs from. It also means a user who moves the panel
+    /// with `margin` in `panel.kdl` moves the popover with it. (If
+    /// saola-theme ever grows a dedicated `popover_margin` token, this is
+    /// the line to change.)
     fn of(role: SurfaceRole, config: &config::PanelConfig, theme: &Theme) -> Self {
         // Popovers share none of the panel surfaces' geometry — different
         // layer, different anchors, a real width, keyboard focus — so they
@@ -413,18 +442,20 @@ impl SurfaceGeometry {
         // role` arms through the arithmetic below.
         if let SurfaceRole::Popover(kind) = role {
             // The panel surface this popover hangs below — the bar in ledger
-            // style, the centre island in islands style (the one island that
-            // reserves a zone). Asking it for its own geometry instead of
-            // repeating the strip arithmetic here means the two can't drift.
+            // style, the islands strip in islands style. Asking it for its
+            // own geometry instead of repeating the strip arithmetic here
+            // means the two can't drift.
             let panel = Self::of(initial_role(config), config, theme);
             let strip = panel.exclusive_zone
                 + match config.edge {
                     config::Edge::Top => panel.margin.0,
                     config::Edge::Bottom => panel.margin.2,
                 };
-            // The 6 px breathing room of spec §6, clamped so an oversized
-            // `height` knob degrades to "touching", never to overlapping the
-            // trigger. See the doc comment for the full derivation.
+            // Clamped at 0: with the bottom-gap reservation the strip
+            // already passes `popover_top`, so the popover sits flush
+            // against the reserved strip — one edge margin below the panel —
+            // and can never climb back over its trigger. See the doc
+            // comment for the full derivation.
             let gap = (theme.sizes.popover_top as i32 - strip).max(0);
             let side = config.margin(theme) as i32;
 
@@ -484,22 +515,21 @@ impl SurfaceGeometry {
                 // proportions, measured off the mockup in Stage 14.5.
                 theme.sizes.panel_margin_ledger_top,
             ),
-            SurfaceRole::Island(_) => (
-                // An island is a `panel_pill` (40), not a `panel_bar` (48).
-                // `config.height` can't be used directly: it resolves an
-                // absent knob to `panel_bar` for *both* styles (unlike
-                // `config.margin`, which is already style-aware). Reading
-                // the `Option` here keeps an explicit `height 52` in
-                // `panel.kdl` working while defaulting to the islands
-                // token. If a later stage teaches `PanelConfig::height` the
-                // same style-awareness `PanelConfig::margin` already has,
-                // this collapses back to `config.height(theme)`.
+            SurfaceRole::Islands => (
+                // The islands strip is a `panel_pill` (40), not a
+                // `panel_bar` (48). `config.height` can't be used directly:
+                // it resolves an absent knob to `panel_bar` for *both*
+                // styles. Reading the `Option` here keeps an explicit
+                // `height 52` in `panel.kdl` working while defaulting to
+                // the islands token.
                 config.height.unwrap_or(theme.sizes.panel_pill),
-                // Islands are inset by the same margin on every edge
-                // (`panel_margin_islands`, 26 — the value
-                // `PanelConfig::margin` already resolves to in this style).
+                // Islands share the ledger bar's insets as of 2026-08-01
+                // (Jordan: the islands should match the ledger panel):
+                // `panel_margin_ledger` at the sides via `config.margin`,
+                // `panel_margin_ledger_top` at the anchored edge. The old
+                // uniform `panel_margin_islands` (26) inset is retired.
                 config.margin(theme),
-                config.margin(theme),
+                theme.sizes.panel_margin_ledger_top,
             ),
             // Unreachable: the `if let` above returns for every popover.
             // Spelled out rather than folded into the `Island` arm so that a
@@ -511,24 +541,15 @@ impl SurfaceGeometry {
         let (height, side_margin, edge_margin) =
             (height as u32, side_margin as i32, edge_margin as i32);
 
+        // A reserving surface reserves its own height **plus one more edge
+        // margin as a bottom gap** (Jordan, 2026-08-01: tiled windows should
+        // keep the same breathing room below the panel as above it). The
+        // compositor adds the anchored-edge margin itself, so the total
+        // reserved strip is `height + 2 × edge margin` — 48+18+18 = 84 for
+        // the ledger bar, 40+18+18 = 76 for the islands strip.
         let exclusive_zone = match role {
-            SurfaceRole::Bar => height as i32,
-            SurfaceRole::Island(IslandKind::Centre) => height as i32,
-            SurfaceRole::Island(_) => 0,
+            SurfaceRole::Bar | SurfaceRole::Islands => height as i32 + edge_margin,
             SurfaceRole::Popover(_) => unreachable!("popovers return above"),
-        };
-
-        // The left/right islands reserve nothing, so the compositor places
-        // them below the centre island's reservation (height + edge margin).
-        // A negative edge margin pulls them back up level with it — the same
-        // "desired offset − reserved strip" arithmetic as the popover's gap,
-        // with the islands' shared margin as the desired offset. See the
-        // exclusive-zone doc comment above for why this replaced `-1`.
-        let edge_margin = match role {
-            SurfaceRole::Island(IslandKind::Left | IslandKind::Right) => {
-                edge_margin - (height as i32 + edge_margin)
-            }
-            _ => edge_margin,
         };
 
         Self {
@@ -539,26 +560,19 @@ impl SurfaceGeometry {
                 config::Edge::Bottom => (0, side_margin, edge_margin, side_margin),
             },
             exclusive_zone,
-            // The bar takes input (it always has) and so, as of Stage 16,
-            // does the **right** island — it carries the quick-settings
-            // trigger, and `events_transparent` is fixed at creation time and
-            // is all-or-nothing per surface (see the field's doc comment), so
-            // an island that needs one click needs them all. The other two
-            // stay click-through, which is what keeps three overlapping
-            // full-width surfaces from fighting over the pointer: an empty
-            // input region takes a surface out of the compositor's hit
-            // testing entirely, whatever the stacking order.
-            //
-            // The cost is that the right island swallows every click in its
-            // full-width strip, not just the ones on its pill. That strip is
-            // inside the panel's own exclusive zone, so there is nothing but
-            // wallpaper underneath it. Giving it a pill-shaped input region
-            // instead would need the pill's measured rect (`SetInputRegion`),
-            // i.e. the measurement problem Stage 15 ruled out.
-            events_transparent: matches!(
-                role,
-                SurfaceRole::Island(IslandKind::Left | IslandKind::Centre)
-            ),
+            // Both panel surfaces take input across their whole full-width
+            // strip, exactly like each other (2026-08-01 — see
+            // `IslandKind`'s doc comment for the history: when the islands
+            // were three overlapping surfaces, only the right one could
+            // take input without the three fighting over the pointer,
+            // which left the mark and media clusters unclickable; the
+            // single strip is what fixed that). The strip sits inside the
+            // panel's own exclusive zone, so the clicks it swallows beside
+            // the pills would otherwise only reach wallpaper. Giving the
+            // surface pill-shaped input regions instead would need each
+            // pill's measured rect (`SetInputRegion`), i.e. the
+            // measurement problem Stage 15 ruled out.
+            events_transparent: false,
             // Every panel surface is a `Top`-layer surface that never takes
             // the keyboard. Only popovers differ, and they returned above.
             layer: Layer::Top,
@@ -573,7 +587,7 @@ impl SurfaceGeometry {
     /// request at all": `exclusive_zone: None` leaves the protocol default
     /// (0 — the pushed-around one, see [`SurfaceGeometry::of`]) and
     /// `namespace: None` inherits the daemon's own namespace, which is why
-    /// all three islands show up as `saola-panel` in `niri msg --json
+    /// spawned surfaces show up as `saola-panel` in `niri msg --json
     /// layers` rather than needing a name each.
     fn new_layer_shell_settings(self) -> iced_layershell::reexport::NewLayerShellSettings {
         iced_layershell::reexport::NewLayerShellSettings {
@@ -592,23 +606,18 @@ impl SurfaceGeometry {
 /// What the surface the runtime creates from `Settings` at boot is *for*,
 /// which depends entirely on the configured layout style.
 ///
-/// A daemon always opens that one surface itself (`StartMode::Active`); it is
-/// not something we can decline. In islands style we therefore have a choice:
-/// close it and spawn three islands, or keep it and let it *be* one of them.
-/// Keeping it wins on both counts that matter — no frame in which a
-/// half-configured surface is visible, and no dependence on being able to
-/// destroy a `Settings`-created surface (which, per Stage 13's handoff, never
-/// even reports its own `Closed` event). The centre island is the one it
-/// becomes, because the centre is the island that carries the exclusive zone
-/// and is therefore the one whose geometry the boot `Settings` most needs to
-/// get right.
+/// A daemon always opens that one surface itself (`StartMode::Active`).
+/// Since 2026-08-01 both styles are a single full-width surface — the bar,
+/// or the islands strip (see [`IslandKind`]'s doc comment for why the
+/// three per-cluster surfaces collapsed into one) — so that boot surface
+/// simply *is* the panel and nothing further spawns at boot.
 ///
 /// This is also the fallback for an Id the registry has never heard of — see
 /// [`Panel::role`].
 fn initial_role(config: &config::PanelConfig) -> SurfaceRole {
     match config.style {
         config::PanelStyle::Ledger => SurfaceRole::Bar,
-        config::PanelStyle::Islands => SurfaceRole::Island(IslandKind::Centre),
+        config::PanelStyle::Islands => SurfaceRole::Islands,
     }
 }
 
@@ -687,13 +696,36 @@ enum Message {
     /// payload is *derived* state: the worker folds niri's event stream into
     /// a model of the focused workspace and ships the finished row (see
     /// `modules::columns`). Sits beside the clock in the centre region.
+    ///
+    /// Its worker is not the module's own: `modules::niri` owns the single
+    /// `$NIRI_SOCKET` connection and emits both this and `WindowTitle` below
+    /// (see `Panel::subscription`'s routing arm, and that module's doc
+    /// comment for why one bridge rather than two connections).
     Columns(modules::columns::Message),
-    /// Wraps `modules::mark::Message` — an *empty* enum (see that module's
-    /// doc comment): the mark is a static glyph with no signal source at
-    /// all, so this variant can never actually be constructed at runtime.
-    /// It exists purely so the mark's wiring shape (`.map(Message::Mark)` at
-    /// the subscription and view composition sites in `Panel::subscription`
-    /// / `Panel::view`) matches every other module's exactly.
+    /// Wraps `modules::window_title::Message` — the focused window's title,
+    /// the left region's ambient text beside the mark (style guide §7).
+    /// `Updated(None)` is "no focused window, or its title is blank", which
+    /// renders as nothing.
+    ///
+    /// Fed by the same `modules::niri` bridge as `Columns` above, which only
+    /// sends this when the title *text* actually changed: niri re-announces a
+    /// window on every retitle, and a terminal spinner does that several
+    /// times a second. Delegated wholesale to the module in `Panel::update`
+    /// (the shape `ClaudeCode` established) rather than destructured here.
+    ///
+    /// The module's other variant, `Tick`, comes from its own gated animation
+    /// timer rather than from niri — the opt-in marquee (style guide §5). It
+    /// travels the same arm, since "what a message means to the module's
+    /// state" is the module's business either way.
+    WindowTitle(modules::window_title::Message),
+    /// Wraps `modules::mark::Message`. Originally an *empty* enum (the mark
+    /// was a static glyph with no signal source at all, and this variant
+    /// existed purely so its wiring shape — `.map(Message::Mark)` at the
+    /// subscription and view composition sites in `Panel::subscription` /
+    /// `Panel::view` — matched every other module's exactly). The mark
+    /// becoming clickable gave it its first real variant,
+    /// `mark::Message::Pressed`, handled below in `Panel::update` by
+    /// spawning the configured `launcher` command.
     Mark(modules::mark::Message),
     /// Wraps `modules::media::Message` (currently just
     /// `Updated(Media)`), a fresh "who's the active MPRIS player" snapshot
@@ -720,14 +752,55 @@ enum Message {
     /// D-Bus, so the async worker pushes each new snapshot through this
     /// message and `update` stores it on `Panel` for `view` to render.
     Network(modules::network::Message),
-    /// Wraps `modules::claude::Message` (currently just
-    /// `Updated(ClaudeCode)`), the derived "what are Jordan's Claude Code
-    /// sessions doing" summary. Unlike every module above, the source isn't
-    /// a service with state to read — it's a broadcast signal a hook script
+    /// Wraps `modules::bluetooth::Message` (just `Updated(Bluetooth)`), a
+    /// fresh BlueZ snapshot — adapter powered state plus the connected
+    /// devices. Same "store the latest snapshot" shape as `Network` above it
+    /// (and it sits right beside it in the right region, the two radios
+    /// together). The worker behind it differs in one way worth knowing:
+    /// its source is a *tree* of D-Bus objects that comes and goes rather
+    /// than one fixed object, so it merges three signal streams and rebuilds
+    /// the whole snapshot on any of them (see `modules::bluetooth`).
+    Bluetooth(modules::bluetooth::Message),
+    /// Wraps `modules::power::Message` — either `Updated(Power)`, a fresh
+    /// power-profiles-daemon snapshot, or `SetProfile(name)`, a
+    /// quick-settings chip asking to switch profiles (a command-out call,
+    /// same shape as `Media::PlayPause` above).
+    ///
+    /// The one variant here with **no bar presence at all**: `power` is the
+    /// panel's first popover-only module (see `modules::power`'s doc
+    /// comment), so unlike every module above it there is no
+    /// `config::ModuleName::Power`, no region slot, and no arm for it in
+    /// `module_view`/`module_is_present` — those are about laying out bar
+    /// regions, and this module never appears in one. Everything else about
+    /// it is standard: a signal-fed worker pushing snapshots that `update`
+    /// stores on `Panel` for the quick-settings popover to read.
+    Power(modules::power::Message),
+    /// Wraps `modules::brightness::Message` — either `Updated(Brightness)`, a
+    /// fresh screen-brightness snapshot, or `SetBrightness(percent)`, the
+    /// quick-settings slider asking for a new level (a command-out call, same
+    /// shape as `Power::SetProfile` above).
+    ///
+    /// The second variant here with **no bar presence at all** (see
+    /// `Power` just above for what that entails — no
+    /// `config::ModuleName::Brightness`, no region slot, no arm in
+    /// `module_view`/`module_is_present`). What is new is the worker behind
+    /// it: brightness has no D-Bus property to watch, so the module reads
+    /// sysfs, writes through logind, and is woken by a udev uevent on a
+    /// dedicated OS thread — the panel's second **thread bridge** after
+    /// `volume` (see `modules::brightness`'s doc comment).
+    Brightness(modules::brightness::Message),
+    /// Wraps `modules::claude::Message` — either `Updated(Sessions)`, the
+    /// folded "what is each of Jordan's Claude Code sessions doing" list
+    /// behind the status-dot row, or `Tick`, one frame of that row's
+    /// breathing animation. Unlike every module above, the source isn't a
+    /// service with state to read — it's a broadcast signal a hook script
     /// fires and forgets (see `modules::claude`'s doc comment for the
-    /// signal-listener bridge shape). Last of the right region, per the
-    /// style guide's module order (`right { volume; network; battery;
-    /// claude; tray; ... }`).
+    /// signal-listener bridge shape, and for why the animation timer is a
+    /// sanctioned exception to "nothing ticks faster than the clock").
+    /// Also the only variant `Panel::update` delegates wholesale to the
+    /// module rather than destructuring itself. Last of the right region,
+    /// per the style guide's module order (`right { volume; network;
+    /// battery; claude; tray; ... }`).
     ClaudeCode(modules::claude::Message),
     /// Wraps `modules::tray::Message` (currently just `Updated(Tray)`), the
     /// current set of registered StatusNotifierItems. The first module whose
@@ -739,7 +812,8 @@ enum Message {
     Tray(modules::tray::Message),
     /// Wraps [`popover::Message`] — the panel's first *interaction* messages
     /// rather than snapshots from a signal source. Three producers: the
-    /// status cluster's `mouse_area` (a trigger click), and the two dismissal
+    /// status cluster's trigger button (a click on it, in either layout),
+    /// and the two dismissal
     /// signals `popover::subscription` filters out of iced's event broadcast
     /// (a surface losing keyboard focus, and Escape). Handled by
     /// `Panel::update_popover`, which is the one place a popover surface is
@@ -755,6 +829,22 @@ enum Message {
     /// `Panel::open_tray_menu` (the `ContextMenu` arm below) and the
     /// `TrayMenu(..)` arms right after it.
     TrayMenu(popovers::tray_menu::Message),
+    /// Wraps [`popovers::claude_usage::Message`] — the Claude Code usage
+    /// popover's one-shot transcript read answering. Same separation as
+    /// `TrayMenu` above: `modules::claude::Message` is about the bar's dot
+    /// row, while this is about the popover the claude group's trigger
+    /// opens. Produced only by the `Task` `Panel::open_claude_usage` kicks
+    /// off on the trigger click; handled by storing the result while that
+    /// popover is still the open one.
+    ClaudeUsage(popovers::claude_usage::Message),
+    /// Wraps [`config_watch::Message`] — `panel.kdl` changed on disk and the
+    /// watcher worker re-parsed it (inotify is the signal; see that module's
+    /// doc comment for the watch-the-directory and debounce mechanics). The
+    /// payload is the whole new [`config::PanelConfig`], parsed off the UI
+    /// thread; the reload arm in `Panel::update` is what re-applies it to
+    /// the running panel — theme palette, config-fed module state, and the
+    /// live layer-shell geometry of the panel surface.
+    Config(config_watch::Message),
     /// A layer-shell surface has finished opening and now has an
     /// `iced::window::Id`. Emitted by `iced::window::open_events()` (see
     /// `Panel::subscription`), which is the **only** way to learn the Id of
@@ -796,27 +886,50 @@ enum SurfaceRole {
     /// The ledger bar: the floating ink pill that is the *whole* panel in
     /// `style "ledger"`. Created by `Settings` at boot; never spawned.
     Bar,
-    /// One of the floating translucent pill clusters of `style "islands"`.
-    Island(IslandKind),
+    /// The islands strip: the *whole* panel in `style "islands"` — all
+    /// three floating pill clusters drawn on one full-width surface (see
+    /// `Panel::islands_view`). Created by `Settings` at boot; never
+    /// spawned. This was `Island(IslandKind)` — one surface per cluster —
+    /// until 2026-08-01; see [`IslandKind`]'s doc comment for why the
+    /// three surfaces collapsed into one.
+    Islands,
     /// A popover: the one transient surface kind, spawned when a trigger is
     /// clicked and destroyed when it is dismissed. At most one exists at a
     /// time — the invariant lives in [`PopoverManager`], not here.
     Popover(PopoverKind),
 }
 
-/// Which island a surface is.
+/// Which island *cluster* an `island_view` call draws — a layer of the
+/// single [`SurfaceRole::Islands`] surface, no longer a surface of its own.
+///
+/// # Why three surfaces became one (2026-08-01)
+///
+/// Stage 15 gave each island its own full-width layer-shell surface, and
+/// Stage 16 could then let only the right one accept pointer events
+/// (`events_transparent` is all-or-nothing per surface, and three
+/// overlapping full-width input regions would have fought over the pointer
+/// — whichever stacked topmost would swallow every click on the strip).
+/// The unpaid bill came due when the *left* cluster grew clickable things:
+/// the mark's launcher and media's play/pause sat on a surface the
+/// compositor never sent a click to, and no assignment of per-surface
+/// input flags can fix that — some cluster always loses. Meanwhile the
+/// right island's full-width input region was already swallowing the
+/// whole strip. Collapsing the three surfaces into one — same pixels,
+/// same input footprint the right island already had, the ledger bar's
+/// exact input model — is what made every cluster clickable at once. It
+/// also retired the negative-margin re-levelling trick the non-reserving
+/// sibling surfaces needed (see git history for `SurfaceGeometry::of`).
 ///
 /// # The three-vs-four deviation (deliberate, flagged)
 ///
-/// Spec §7 inventories the Islands panel as **four** separate layer-shell
-/// surfaces: mark + media, clock + column strip, status, and *notifications*.
-/// This phase ships **three**. Everything notifications — daemon, popups,
-/// centre, and the bar indicator — is out of scope for Phase 2 by an explicit
-/// decision recorded in PLAN.md; a future `saola-notifications` component
-/// owns it. Nothing here forecloses the fourth: it arrives as one more
-/// variant on this enum plus one more arm in each of the three matches that
-/// consume it (`SurfaceGeometry::of`, `Panel::island_view`,
-/// `Panel::spawn_boot_surfaces`), all of which the compiler will demand.
+/// Spec §7 inventories the Islands panel as **four** clusters: mark +
+/// window title, clock + column strip, status, and *notifications*. This phase
+/// ships **three**. Everything notifications is out of scope for Phase 2
+/// by an explicit decision recorded in PLAN.md; a future
+/// `saola-notifications` component owns it. Nothing here forecloses the
+/// fourth: it arrives as one more variant on this enum plus one more
+/// layer in `Panel::islands_view` and an arm in `Panel::island_view`,
+/// which the compiler will demand.
 ///
 /// The variants are named for **position, not payload**, because that is what
 /// the config actually configures: each one maps 1:1 onto one of
@@ -827,11 +940,11 @@ enum SurfaceRole {
 /// the fourth slot would need.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IslandKind {
-    /// `config.left` — the mark and the media pill, hugging the left margin.
+    /// `config.left` — the mark and the focused window title, hugging the
+    /// left margin. Media moved out of this region entirely (style guide
+    /// §7, 2026-08-01): it's a status-cluster glyph now, part of `Right`.
     Left,
     /// `config.center` — the clock and the niri column minimap, centred.
-    /// This is the island that carries the panel's exclusive zone, and the
-    /// one the boot `Settings` surface becomes (see `initial_role`).
     Centre,
     /// `config.right` — the status cluster, hugging the right margin.
     Right,
@@ -842,13 +955,15 @@ enum IslandKind {
 /// adds `mark`; Stage 9 adds `media`; Stage 13 adds the `windows` surface
 /// registry.
 struct Panel {
-    /// The Saola theme, loaded once at boot — the single source of every
-    /// color and size on the bar. `main` applies `panel.kdl`'s `colors { }`
-    /// overrides to a `Theme::saola()` before this field is ever populated
-    /// (see `config::ColorOverrides::apply`), so every color read from here
-    /// already reflects the user's config.
+    /// The Saola theme — the single source of every color and size on the
+    /// bar. `main` applies `panel.kdl`'s `colors { }` overrides to a
+    /// `Theme::saola()` before this field is ever populated (see
+    /// `config::ColorOverrides::apply`), so every color read from here
+    /// already reflects the user's config; a live config reload rebuilds it
+    /// the same way (see the `Message::Config` arm in [`Panel::update`]).
     theme: Theme,
-    /// The parsed `panel.kdl` config, loaded once at boot (Stage 14). Read
+    /// The parsed `panel.kdl` config, loaded at boot (Stage 14) and swapped
+    /// wholesale by a live reload (the `Message::Config` arm). Read
     /// by `Panel::bar_view`/`Panel::module_view` for the module lists;
     /// `theme`/`edge`/`height`/`margin` were already consumed in
     /// `main` before `Panel::new` ran (they shape the layer-shell surface
@@ -859,23 +974,59 @@ struct Panel {
     /// "the parts main needed" from "the parts view needs" into two structs
     /// would be needless ceremony.
     config: config::PanelConfig,
+    /// The command-line flags `main` parsed at boot, kept so a live config
+    /// reload can re-apply them on top of the freshly read file — `cargo run
+    /// -- --islands` must keep meaning Islands across every reload of a
+    /// `panel.kdl` that says `style "ledger"`, the same precedence the boot
+    /// read had. (The flags themselves can't change mid-process: argv is
+    /// fixed at exec time, so storing the parsed value is exact, not a
+    /// cache that could go stale.)
+    cli: config::CliOverrides,
+    /// Where `panel.kdl` lives, as `main` resolved it once at boot
+    /// (`config::PanelConfig::resolve_path`: `--config-dir` >
+    /// `$SAOLA_CONFIG_DIR` > the XDG chain). Held only so
+    /// [`Panel::subscription`] can hand it to the `config_watch` worker —
+    /// the boot load already happened in `main` — and `None` (nothing in
+    /// the chain resolved: no flag, no vars, no `$HOME`) means no watch
+    /// subscription at all, the same "no config is possible here"
+    /// environment the loader treats as pure defaults. Stable for the
+    /// process's life for the same argv-and-env-are-fixed reason `cli` is.
+    config_path: Option<PathBuf>,
     /// The clock module's state (currently empty — see `Clock`'s doc
     /// comment for why).
     clock: Clock,
     /// The bar's mark: a static glyph (see `Mark`'s doc comment) whose
     /// *choice* of glyph — horns, notch, a user file, or none — comes from
-    /// `panel.kdl`'s `mark` directive, resolved once at construction time
-    /// into `Mark::new(config.mark.clone())` below.
+    /// `panel.kdl`'s `mark` directive, and whose click-to-launch command
+    /// comes from the `launcher` directive, both resolved once at
+    /// construction time into `Mark::new(config.mark.clone(),
+    /// config.launcher.clone())` below.
     mark: Mark,
+    /// The launcher process spawned by the last mark click, while we still
+    /// believe it may be running. Holding the `Child` here (rather than
+    /// handing it to a fire-and-forget reaper thread, as this arm
+    /// originally did) is what makes the mark a *toggle*: a second click
+    /// while the launcher is up kills it instead of stacking a second
+    /// copy. See the `Message::Mark(..Pressed)` arm for the
+    /// running-or-exited decision and the `Message::Clock(..Tick)` arm for
+    /// how a launcher that exits on its own still gets reaped.
+    launcher_child: Option<std::process::Child>,
     /// The last niri column strip pushed by the niri IPC worker; starts as
     /// `Columns::default()` (an empty dash row → renders nothing, which is
     /// also what a non-niri session leaves it at forever). Sits beside the
     /// clock in the centre region, per the style guide's
     /// `center { clock; niri-columns }`.
     columns: Columns,
+    /// The focused window's title, as the niri bridge last reported it;
+    /// starts as "nothing focused yet" → renders nothing (and stays there
+    /// forever outside a niri session). Sits in the left region immediately
+    /// right of the mark, per the style guide's `left { mark; window-title }`.
+    window_title: WindowTitle,
     /// The last "active MPRIS player" snapshot pushed by the media worker;
     /// starts as `Media::default()` (no player known yet → renders
-    /// nothing). Sits beside the mark in the bar's left region.
+    /// nothing). A status-cluster glyph as of 2026-08-01 (style guide §7):
+    /// sits at the head of the right region's status cluster, per the
+    /// style guide's `right { mpris; volume; network; ... }`.
     media: Media,
     /// The last default-sink volume snapshot pushed by the pulse worker
     /// thread; starts as `Volume::default()` (no sink known yet → renders
@@ -888,12 +1039,31 @@ struct Panel {
     /// The last Wi-Fi snapshot pushed by the iwd worker; starts as
     /// `Network::default()` (no Station known yet → renders nothing).
     network: Network,
-    /// The last derived "what are Jordan's sessions doing" summary folded
-    /// by the Claude Code signal-listener worker; starts as
-    /// `ClaudeCode::default()` (no `StatusChanged` signal seen yet →
-    /// renders nothing — the same "quiet until proven otherwise" contract
-    /// as every module above, just for a hook that hasn't fired instead of
-    /// a service that isn't there). Last of the right region.
+    /// The last BlueZ snapshot pushed by the Bluetooth worker; starts as
+    /// `Bluetooth::default()` (no adapter known yet → renders nothing, which
+    /// is also where a machine with no Bluetooth hardware stays forever).
+    /// Sits beside `network` in the right region.
+    bluetooth: modules::bluetooth::Bluetooth,
+    /// The last power-profiles-daemon snapshot (active profile + the
+    /// profiles this machine supports); starts as `Power::default()` (daemon
+    /// not heard from → the quick-settings row draws nothing). Unlike every
+    /// field above it this one feeds **no bar region** — it exists solely for
+    /// the quick-settings popover, which is why `modules::power` has no
+    /// `view` and no `config::ModuleName` (see `Message::Power`).
+    power: modules::power::Power,
+    /// The last screen-brightness snapshot (percent, plus the device name and
+    /// raw ceiling a write needs); starts as `Brightness::default()` (no
+    /// backlight found → the quick-settings row draws nothing, which is also
+    /// where a desktop with no backlight at all stays forever). Popover-only,
+    /// like `power` above it (see `Message::Brightness`).
+    brightness: modules::brightness::Brightness,
+    /// One status dot per live Claude Code session, folded by the
+    /// signal-listener worker (plus the phase of their breathing
+    /// animation); starts as `ClaudeCode::default()` (no `StatusChanged`
+    /// signal seen yet → renders nothing — the same "quiet until proven
+    /// otherwise" contract as every module above, just for a hook that
+    /// hasn't fired instead of a service that isn't there). Last of the
+    /// right region.
     claude_code: ClaudeCode,
     /// The registered StatusNotifierItems the tray worker last reported;
     /// starts as `Tray::default()` (nothing registered → renders nothing).
@@ -936,32 +1106,55 @@ struct Panel {
     /// state, which has no notion of a popover). See
     /// `popovers::tray_menu::TrayMenuState`'s doc comment.
     tray_menu: popovers::tray_menu::TrayMenuState,
+    /// State for the Claude Code usage popover's content: whether the
+    /// transcript reads are still in flight, and the per-session results
+    /// once they land. Same shape and reasoning as `tray_menu` above — the
+    /// content module (`popovers::claude_usage`) defines the type, `Panel`
+    /// holds the instance, and it only means anything while that popover
+    /// is open. Reset by every trigger click (see `Panel::
+    /// open_claude_usage`), so a reopened popover always re-reads.
+    claude_usage: popovers::claude_usage::ClaudeUsageState,
 }
 
 impl Panel {
-    /// Boot. `config`/`theme` are threaded in from `main`'s closure (see the
-    /// `daemon(move || Panel::new(..), ..)` call) rather than each
-    /// re-derived here, so `panel.kdl` is read exactly once per process —
+    /// Boot. `config`/`cli`/`theme` are threaded in from `main`'s closure
+    /// (see the `daemon(move || Panel::new(..), ..)` call) rather than each
+    /// re-derived here, so `panel.kdl` is read exactly once per *boot* —
     /// `main` already needed `config`/`theme` before this point to size the
     /// layer-shell surface, and re-parsing the file a second time here
     /// would risk observing a different config if it changed between the
     /// two reads (unlikely in practice, since both happen within the same
-    /// boot, but needless).
-    fn new(config: config::PanelConfig, theme: Theme) -> Self {
+    /// boot, but needless). Later reads are deliberate: the `config_watch`
+    /// worker re-parses the file each time it changes on disk, and the
+    /// `Message::Config` arm below applies the result.
+    fn new(
+        config: config::PanelConfig,
+        cli: config::CliOverrides,
+        config_path: Option<PathBuf>,
+        theme: Theme,
+    ) -> Self {
         Self {
-            mark: Mark::new(config.mark.clone()),
+            cli,
+            config_path,
+            mark: Mark::new(config.mark.clone(), config.launcher.clone()),
+            launcher_child: None,
             clock: Clock,
             columns: Columns::default(),
+            window_title: WindowTitle::new(config.window_title),
             media: Media::default(),
             volume: Volume::default(),
             battery: Battery::default(),
             network: Network::default(),
-            claude_code: ClaudeCode::default(),
+            bluetooth: modules::bluetooth::Bluetooth::default(),
+            power: modules::power::Power::default(),
+            brightness: modules::brightness::Brightness::default(),
+            claude_code: ClaudeCode::new(config.claude_icon),
             tray: Tray::default(),
             windows: HashMap::new(),
             popovers: PopoverManager::default(),
             volume_commands: None,
             tray_menu: popovers::tray_menu::TrayMenuState::default(),
+            claude_usage: popovers::claude_usage::ClaudeUsageState::default(),
             theme,
             config,
         }
@@ -982,9 +1175,12 @@ impl Panel {
     /// Ask for the surfaces the configured style needs *in addition to* the
     /// one the runtime creates from `Settings`.
     ///
-    /// Ledger: none — the bar is that one surface. Islands: the left and
-    /// right islands, the centre one being what the boot surface already is
-    /// (see `initial_role`).
+    /// As of 2026-08-01 that is **none for both styles**: the bar and the
+    /// islands strip are each a single full-width surface, and each *is*
+    /// the boot surface (see `initial_role`, and `IslandKind`'s doc
+    /// comment for why the islands' three per-cluster surfaces collapsed
+    /// into one). The method survives as the seam where a future extra
+    /// surface — the flagged notifications slot — would be requested.
     ///
     /// Ordering note for whoever adds surfaces later: these requests are
     /// issued before the compositor has created *any* of our surfaces, which
@@ -993,26 +1189,12 @@ impl Panel {
     /// `waiting_layer_shell_actions` queue and retried, not dropped
     /// (`iced_layershell-0.19.1/src/multi_window.rs:708–715`).
     fn spawn_boot_surfaces(&mut self) -> Task<Message> {
-        match self.config.style {
-            config::PanelStyle::Ledger => Task::none(),
-            config::PanelStyle::Islands => {
-                Task::batch([IslandKind::Left, IslandKind::Right].map(|kind| {
-                    let role = SurfaceRole::Island(kind);
-                    let geometry = SurfaceGeometry::of(role, &self.config, &self.theme);
-                    // The Id is discarded here: an island's role is recorded
-                    // by `spawn_surface` itself and nothing else needs to
-                    // name the surface again. Popovers do need it — see
-                    // `Panel::update_popover`.
-                    let (_id, task) = self.spawn_surface(role, geometry.new_layer_shell_settings());
-                    task
-                }))
-            }
-        }
+        Task::none()
     }
 
     /// The role of the surface identified by `id` — **the boot surface's
     /// role for an Id the registry has never heard of** (`initial_role`:
-    /// the bar in ledger style, the centre island in islands style), which
+    /// the bar in ledger style, the islands strip in islands style), which
     /// is the defensive fallback the Phase 2 architecture asks for.
     ///
     /// That fallback is not theoretical: it is the normal path for the boot
@@ -1100,6 +1282,14 @@ impl Panel {
                 self.columns = columns;
                 Task::none()
             }
+            // The niri bridge's other half. Delegated to the module (the
+            // shape `claude.rs` established) rather than destructured here:
+            // what a title message means to the module's state is the
+            // module's business.
+            Message::WindowTitle(message) => {
+                self.window_title.update(message);
+                Task::none()
+            }
             Message::Media(modules::media::Message::Updated(media)) => {
                 self.media = media;
                 Task::none()
@@ -1161,8 +1351,64 @@ impl Panel {
                 self.network = network;
                 Task::none()
             }
-            Message::ClaudeCode(modules::claude::Message::Updated(claude_code)) => {
-                self.claude_code = claude_code;
+            Message::Bluetooth(modules::bluetooth::Message::Updated(bluetooth)) => {
+                self.bluetooth = bluetooth;
+                Task::none()
+            }
+            Message::Power(modules::power::Message::Updated(power)) => {
+                self.power = power;
+                Task::none()
+            }
+            // A quick-settings profile chip. Command-out, exactly like the
+            // media transport arms above: a one-shot `Task` that connects,
+            // writes the `ActiveProfile` property, and drops the connection,
+            // `.map(Message::Power)`ed for uniformity even though
+            // `Task::future(..).discard()` never actually produces a
+            // `power::Message`. The UI is *not* updated optimistically here
+            // — the daemon's own `PropertiesChanged` is what moves the
+            // selected chip, so a write polkit refuses leaves the popover
+            // showing the truth rather than a lie.
+            Message::Power(modules::power::Message::SetProfile(profile)) => {
+                modules::power::set_profile(profile).map(Message::Power)
+            }
+            Message::Brightness(modules::brightness::Message::Updated(brightness)) => {
+                self.brightness = brightness;
+                Task::none()
+            }
+            // The quick-settings brightness slider. Command-out like the two
+            // arms above, with one wrinkle of its own: the message carries
+            // only a *percent*, because the popover has no business knowing
+            // this backlight's driver scale (see
+            // `modules::brightness::Message::SetBrightness`). The device name
+            // and that scale come off the last snapshot stored just above,
+            // which is also what makes the not-present case a genuine no-op
+            // rather than a guess — a machine with no backlight has nothing
+            // to address the call to, so the slider (which is not drawn at
+            // all in that case) degrades quietly, the same contract as
+            // `volume_commands` being `None`.
+            Message::Brightness(modules::brightness::Message::SetBrightness(percent)) => {
+                if self.brightness.is_present() {
+                    modules::brightness::set_brightness(
+                        self.brightness.device().to_owned(),
+                        self.brightness.raw_max(),
+                        percent,
+                    )
+                    .map(Message::Brightness)
+                } else {
+                    Task::none()
+                }
+            }
+            // The one module that *delegates* rather than storing a
+            // snapshot: `claude::Message` carries both a new session list
+            // and the frames of the dot row's breathing animation, and
+            // folding a tick into an animation epoch is this module's own
+            // business, not the panel's. So the outer variant is unwrapped
+            // and the inner value handed straight to the module (see
+            // `modules::claude::ClaudeCode::update`) — the per-module
+            // refactor's endpoint, and the shape the remaining modules
+            // would take if they ever grew logic of their own.
+            Message::ClaudeCode(message) => {
+                self.claude_code.update(message);
                 Task::none()
             }
             Message::Tray(modules::tray::Message::Updated(tray)) => {
@@ -1175,8 +1421,12 @@ impl Panel {
             // doc comment and `modules::media`'s "command-out pattern"
             // section, which this copies verbatim) — `.map(Message::Tray)`
             // lifts it the same way every module's subscription/view
-            // already is, even though these tasks never actually produce a
-            // `tray::Message` (`Task::future(..).discard()`'s whole point).
+            // already is. `scroll`'s task never produces a message;
+            // `activate`'s produces exactly one — `ContextMenu`, routed
+            // back through this match to the arm below — when the item
+            // answers `UnknownMethod` (a menu-only item that never
+            // declared `ItemIsMenu`; see `modules::tray::activate`'s doc
+            // comment for the fallback).
             Message::Tray(modules::tray::Message::Activate(id)) => {
                 modules::tray::activate(id).map(Message::Tray)
             }
@@ -1244,9 +1494,9 @@ impl Panel {
             // afterwards — overwriting would demote every island and popover
             // back to `Bar` the moment it appeared. So the only Id this arm
             // ever actually writes is one nobody could have pre-registered,
-            // which is exactly the surface `Settings` created at boot: the
-            // surface `Settings` created at boot — the ledger bar, or the
-            // centre island in islands style (`initial_role`). (With
+            // which is exactly the surface `Settings` created at boot — the
+            // ledger bar, or the islands strip in islands style
+            // (`initial_role`). (With
             // `StartMode::AllScreens` there would be one such surface per
             // output, and each would land here with that same role — the
             // registry is already shaped for that.)
@@ -1279,6 +1529,129 @@ impl Panel {
                 self.popovers.closed(id);
                 Task::none()
             }
+            // `panel.kdl` changed on disk: the watcher already read and
+            // parsed it (see `config_watch`); this arm's job is to make the
+            // running panel *match* the new config — the live counterpart of
+            // everything `main` + `Panel::new` derived from the boot read.
+            Message::Config(config_watch::Message::Reloaded(new_config)) => {
+                self.reload_config(new_config)
+            }
+            // The mark was clicked. Only ever reaches here when
+            // `self.mark`'s configured launcher is `Some(..)` — `Mark::view`
+            // doesn't build a clickable button at all otherwise, so there is
+            // no widget that could have sent this.
+            //
+            // Deliberately synchronous, unlike the D-Bus command-out arms
+            // above (`Media::PlayPause`, `Tray::Activate`, …): those return a
+            // `Task` because a zbus call is itself async work the runtime
+            // needs to drive. Spawning a local child process has no such
+            // need — `std::process::Command::spawn` returns as soon as the
+            // OS has forked/exec'd the new process, without waiting for it
+            // to do anything — so this arm just does the spawn inline and
+            // returns `Task::none()`, the same as every other "store some
+            // state and move on" arm above.
+            Message::Mark(modules::mark::Message::Pressed) => {
+                let Some(launcher) = self.mark.launcher() else {
+                    // Shouldn't happen (see this arm's opening comment), but
+                    // a stale/impossible message is a no-op, not a panic —
+                    // the same defensive posture the rest of `update` takes
+                    // toward messages that "can't" occur.
+                    return Task::none();
+                };
+                // Toggle: if the launcher we spawned last click is still
+                // running, this click *closes* it rather than stacking a
+                // second copy on screen.
+                //
+                // Teaching note (`try_wait` vs `wait`): `wait()` blocks
+                // until the child exits — unusable on the UI thread.
+                // `try_wait()` is its non-blocking probe: `Ok(Some(status))`
+                // means "already exited" (and, crucially, *reaps* it — the
+                // kernel drops the process-table entry as a side effect of
+                // the successful wait), `Ok(None)` means "still running".
+                // So this one call is both our liveness check and our
+                // zombie cleanup for a launcher that closed itself (Esc in
+                // fuzzel, or picking an app) since the last click.
+                if let Some(child) = self.launcher_child.as_mut() {
+                    if matches!(child.try_wait(), Ok(None)) {
+                        // Still running → this click is the "close" half of
+                        // the toggle. `Child::kill` is SIGKILL (std offers
+                        // no gentler signal), which is fine for a launcher:
+                        // it has no state to save, and the compositor tears
+                        // down its surface either way. The follow-up
+                        // `wait()` is safe on the UI thread here — a
+                        // SIGKILLed process is gone effectively
+                        // immediately, and waiting is what reaps it.
+                        let mut child = self.launcher_child.take().expect("checked above");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Task::none();
+                    }
+                    // Exited on its own (or `try_wait` errored, meaning
+                    // there is no child to speak of) → forget it and fall
+                    // through to a fresh spawn.
+                    self.launcher_child = None;
+                }
+                // Teaching note: no shell, no quoting. This is deliberately
+                // the simplest possible command-line split — the first
+                // whitespace-separated token is the program,
+                // everything after is its arguments verbatim. It cannot run
+                // `sh -c "…"` semantics (pipes, quoted arguments containing
+                // spaces, `$HOME` expansion, …); `panel.kdl`'s `launcher`
+                // directive is documented as a plain argv list for exactly
+                // this reason. Good enough for `"fuzzel"` or `"wofi --show
+                // drun"`; a user who needs a shell pipeline can always point
+                // `launcher` at a small wrapper script instead.
+                let mut parts = launcher.split_whitespace();
+                let Some(program) = parts.next() else {
+                    // An empty (or all-whitespace) `launcher` string. Warn
+                    // once per click rather than silently doing nothing —
+                    // this is a config problem, not a transient condition.
+                    eprintln!("saola-panel: launcher command is empty — nothing to run");
+                    return Task::none();
+                };
+                match std::process::Command::new(program).args(parts).spawn() {
+                    Ok(child) => {
+                        // A spawned `std::process::Child` becomes a zombie
+                        // process (reaped by nobody, entry lingering in the
+                        // process table) the moment it exits, unless
+                        // something eventually calls `.wait()`/`try_wait()`
+                        // on it. This used to be a fire-and-forget reaper
+                        // thread; now that the toggle needs to *ask* whether
+                        // the launcher is still up, the `Child` lives in
+                        // `self.launcher_child` instead, and reaping happens
+                        // at the two places that already probe it with
+                        // `try_wait`: the next mark click (above) and the
+                        // clock's minute tick (the catch-up reap in the
+                        // `Message::Clock` arm — no new timer, per the
+                        // "every module maps to a signal" rule).
+                        self.launcher_child = Some(child);
+                    }
+                    Err(err) => {
+                        eprintln!("saola-panel: failed to launch \"{launcher}\": {err}");
+                    }
+                }
+                Task::none()
+            }
+            // The claude group's trigger. Routed to its own opener rather
+            // than the generic arm below because opening this popover also
+            // kicks off the transcript-read task — the same "trigger +
+            // fetch in one update" shape `open_tray_menu` established for
+            // right-clicks (this specific pattern must stay above the
+            // catch-all `Message::Popover(message)` arm to be reachable).
+            Message::Popover(popover::Message::Triggered(PopoverKind::ClaudeUsage)) => {
+                self.open_claude_usage()
+            }
+            // The transcript reads answered. Applied only while the usage
+            // popover is still the open one — a read that lands after
+            // dismissal (or after a reopen already reset the state) must
+            // not resurrect a stale snapshot, the same guard as
+            // `TrayMenu::Loaded`'s item-id check above.
+            Message::ClaudeUsage(popovers::claude_usage::Message::Loaded(sessions)) => {
+                if self.popovers.is_open(PopoverKind::ClaudeUsage) {
+                    self.claude_usage.set_loaded(sessions);
+                }
+                Task::none()
+            }
             // The only messages in this enum that *do* something rather than
             // storing something. Delegated rather than inlined because the
             // decision (what closes what) is a state machine worth testing on
@@ -1286,12 +1659,156 @@ impl Panel {
             Message::Popover(message) => self.update_popover(message),
             // `Message::Clock(clock::Message::Tick)` carries no state to
             // store (see `modules::clock::Message`'s doc comment) —
-            // reaching `update` at all is what wakes the re-render. The
-            // macro-injected layer-shell variants never reach here either
-            // (see the outer `Message` doc comment) — both fall through to
-            // this same catch-all.
+            // reaching `update` at all is what wakes the re-render. It
+            // does double duty as the launcher's catch-up reaper: if the
+            // launcher exited on its own (Esc in fuzzel), nothing else
+            // would `wait()` on it until the next mark click, so it would
+            // sit in the process table as a zombie indefinitely. The
+            // minute tick already arrives as a signal — piggybacking one
+            // non-blocking `try_wait` probe on it (which reaps on
+            // `Ok(Some(_))`, see the mark arm's teaching note) bounds that
+            // zombie's lifetime to a minute without adding any timer of
+            // our own.
+            Message::Clock(modules::clock::Message::Tick) => {
+                if let Some(child) = self.launcher_child.as_mut() {
+                    if !matches!(child.try_wait(), Ok(None)) {
+                        self.launcher_child = None;
+                    }
+                }
+                Task::none()
+            }
+            // The macro-injected layer-shell variants never reach here
+            // (see the outer `Message` doc comment) — they fall through to
+            // this catch-all.
             _ => Task::none(),
         }
+    }
+
+    /// Make the running panel match a freshly reloaded `panel.kdl` — the
+    /// live counterpart of everything `main` + [`Panel::new`] derived from
+    /// the boot read, in the same order.
+    ///
+    /// # What has to be re-derived, and what doesn't (teaching note)
+    ///
+    /// Most of the panel reads `self.config`/`self.theme` **live, on every
+    /// frame** — the module lists in `bar_view`/`islands_view`, every color
+    /// and size in every `view` — so for those, swapping the two fields *is*
+    /// the reload; the next render simply reads the new values. Only three
+    /// kinds of state were **copied out of** the config at boot and would
+    /// otherwise keep the old values:
+    ///
+    /// 1. **Config-fed module state** — the mark's glyph/launcher, the
+    ///    window title's knobs, the claude row's brand icon, each handed to
+    ///    the module at construction. The mark is rebuilt outright (it holds
+    ///    nothing but config); the other two get targeted setters so the
+    ///    state their *signals* built up — the title on screen, the session
+    ///    dots — survives the reload instead of blanking until the next
+    ///    event happens to re-announce it.
+    /// 2. **The panel surface's layer-shell geometry** — anchor, size,
+    ///    margins, exclusive zone, all fixed when the surface was created.
+    ///    The `#[to_layer_message(multi)]` control variants exist for
+    ///    exactly this: each is intercepted by the runtime (never reaching
+    ///    `update`) and re-issues the corresponding protocol request on the
+    ///    live surface. A style flip (ledger ↔ islands) additionally
+    ///    re-roles the surface in `windows`, which is all `view` needs to
+    ///    start drawing the other layout on it — both styles have been one
+    ///    full-width surface since 2026-08-01, so no surface is created or
+    ///    destroyed.
+    /// 3. **An open popover** — its surface geometry was derived from the
+    ///    old config at spawn time, so if the panel moved, the popover would
+    ///    be left hanging where the panel used to be. Dismissing it (only
+    ///    when the geometry actually changed) is simpler and more honest
+    ///    than teaching every popover to migrate; reopening is one click.
+    ///
+    /// The theme is rebuilt **from `Theme::saola()`**, not by mutating
+    /// `self.theme`: `ColorOverrides::apply` only writes the fields that are
+    /// `Some`, so applying a new config's overrides onto the already-
+    /// overridden palette could never *revert* a color the user deleted from
+    /// `colors { }`.
+    ///
+    /// CLI flags are re-applied first — `self.cli` outranks the file on
+    /// every read, not just the boot one (see that field's doc comment).
+    fn reload_config(&mut self, mut new_config: config::PanelConfig) -> Task<Message> {
+        self.cli.apply(&mut new_config);
+        // The watcher reloads on any change to the file, including edits
+        // that resolve to the identical config (whitespace, comments, a
+        // knob rewritten to its default). Nothing below is *unsafe* to run
+        // then, but skipping keeps a no-op save from resetting an in-flight
+        // marquee sweep or dismissing an open popover.
+        if new_config == self.config {
+            return Task::none();
+        }
+
+        let mut theme = Theme::saola();
+        new_config.colors.apply(&mut theme.palette);
+
+        self.mark = Mark::new(new_config.mark.clone(), new_config.launcher.clone());
+        self.window_title.set_config(new_config.window_title);
+        self.claude_code.set_icon(new_config.claude_icon);
+
+        let old_role = initial_role(&self.config);
+        let new_role = initial_role(&new_config);
+        let old_geometry = SurfaceGeometry::of(old_role, &self.config, &self.theme);
+        let new_geometry = SurfaceGeometry::of(new_role, &new_config, &theme);
+
+        self.theme = theme;
+        self.config = new_config;
+
+        if new_geometry == old_geometry && new_role == old_role {
+            // A content-only change (module lists, mark, colors, …): the
+            // next render picks it up from the swapped fields, and the
+            // surface itself is exactly where it should be.
+            return Task::none();
+        }
+
+        // Collected before the loop below because re-roling mutates
+        // `windows` while iterating would be a second borrow. Plural on
+        // purpose: with `StartMode::AllScreens` there would be one panel
+        // surface per output, and each needs the same re-role + re-geometry.
+        let panel_ids: Vec<window::Id> = self
+            .windows
+            .iter()
+            .filter(|(_, role)| matches!(role, SurfaceRole::Bar | SurfaceRole::Islands))
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut tasks = Vec::new();
+        for id in panel_ids {
+            self.windows.insert(id, new_role);
+            tasks.push(Task::done(Message::AnchorChange {
+                id,
+                anchor: new_geometry.anchor,
+            }));
+            tasks.push(Task::done(Message::SizeChange {
+                id,
+                size: new_geometry.size,
+            }));
+            tasks.push(Task::done(Message::MarginChange {
+                id,
+                margin: new_geometry.margin,
+            }));
+            tasks.push(Task::done(Message::ExclusiveZoneChange {
+                id,
+                zone_size: new_geometry.exclusive_zone,
+            }));
+        }
+
+        // Same no-kind-check dismissal as Escape; see `PopoverManager::
+        // close_any`'s doc comment for why a moved panel orphans its
+        // popover. `Action::None` (nothing open) makes this a no-op.
+        let action = self.popovers.close_any();
+        tasks.push(self.apply_popover_action(action));
+        // And the popover *content* state goes with the surface: leaving
+        // `tray_menu` populated would keep its Id-keyed dbusmenu watcher
+        // (see the `run_with` arm in `Panel::subscription`) alive for a
+        // popover that no longer exists, and let a straggler `Loaded` fold
+        // menu data into dead state. Both resets are no-ops when the
+        // dismissed popover wasn't theirs (the fields were already
+        // default).
+        self.tray_menu = popovers::tray_menu::TrayMenuState::default();
+        self.claude_usage = popovers::claude_usage::ClaudeUsageState::default();
+
+        Task::batch(tasks)
     }
 
     /// Turn a popover decision into surfaces.
@@ -1397,6 +1914,30 @@ impl Panel {
         ])
     }
 
+    /// The claude group's trigger was clicked: toggle the usage popover,
+    /// and — when the click *opened* it — snapshot the session list and
+    /// kick off the transcript reads.
+    ///
+    /// The toggle itself is the ordinary `PopoverManager` lifecycle
+    /// (second click closes, quick settings/tray menus are displaced —
+    /// nothing new). What this method adds is the fetch: `open_tray_menu`'s
+    /// "trigger + fetch in one update" shape, minus the per-item cases a
+    /// tray has and a usage readout doesn't. Ordering note: `is_open` is
+    /// asked *after* `update_popover` has run, so it reports the toggle's
+    /// outcome — open means this click opened it.
+    fn open_claude_usage(&mut self) -> Task<Message> {
+        let toggle = self.update_popover(popover::Message::Triggered(PopoverKind::ClaudeUsage));
+        if self.popovers.is_open(PopoverKind::ClaudeUsage) {
+            self.claude_usage = popovers::claude_usage::ClaudeUsageState::opening();
+            Task::batch([toggle, fetch_claude_usage(self.claude_code.usage_targets())])
+        } else {
+            // The click closed it: drop the stale numbers so the next open
+            // starts from its loading line rather than flashing them.
+            self.claude_usage = popovers::claude_usage::ClaudeUsageState::default();
+            toggle
+        }
+    }
+
     /// Bridge the Saola theme to iced's built-in theme type so unstyled or
     /// third-party widgets still land inside the Saola palette. Widgets we
     /// style ourselves use the `saola_theme::style` helpers instead and
@@ -1478,7 +2019,24 @@ impl Panel {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             self.clock.subscription().map(Message::Clock),
+            // The panel's single `$NIRI_SOCKET` connection, feeding two
+            // modules: `modules::niri` owns the socket and the fold, and
+            // hands back each module's *own* message pre-built, so this is
+            // pure routing — one arm per consumer, no niri knowledge on this
+            // side (see that module's doc comment). Neither module's own
+            // `subscription()` carries a niri signal, and both are still
+            // listed below so the batch reads uniformly.
+            modules::niri::subscription().map(|message| match message {
+                modules::niri::Message::Columns(message) => Message::Columns(message),
+                modules::niri::Message::WindowTitle(message) => Message::WindowTitle(message),
+            }),
             self.columns.subscription().map(Message::Columns),
+            // `Subscription::none()` in every default configuration: this one
+            // is the opt-in marquee's animation timer (style guide §5), gated
+            // exactly like `claude_code`'s breath below — it exists only while
+            // `overflow "marquee"` is configured *and* the title on screen
+            // actually overflows. See `WindowTitle::subscription`.
+            self.window_title.subscription().map(Message::WindowTitle),
             // Always `Subscription::none()` (see `Mark::subscription`'s doc
             // comment) — included so the batch's shape stays uniform across
             // every module rather than special-casing the one with no
@@ -1488,8 +2046,35 @@ impl Panel {
             self.volume.subscription().map(Message::Volume),
             self.battery.subscription().map(Message::Battery),
             self.network.subscription().map(Message::Network),
+            self.bluetooth.subscription().map(Message::Bluetooth),
+            // No bar module produces this one — `power` feeds the
+            // quick-settings popover only (see `Message::Power`). It still
+            // belongs in this batch rather than somewhere popover-local:
+            // iced has exactly one subscription set per *application*, and a
+            // worker that only ran while a popover happened to be open would
+            // reconnect to D-Bus on every open.
+            self.power.subscription().map(Message::Power),
+            // Popover-only too (see the note on `power` just above — the same
+            // "one subscription set per application" reasoning applies). This
+            // one's worker is an OS thread rather than an async task, which
+            // makes belonging to this batch load-bearing rather than merely
+            // tidy: a subscription torn down and rebuilt per popover-open
+            // would spawn a fresh thread each time.
+            self.brightness.subscription().map(Message::Brightness),
             self.claude_code.subscription().map(Message::ClaudeCode),
             self.tray.subscription().map(Message::Tray),
+            // `panel.kdl` live-reload. Not a module signal either — it feeds
+            // the whole panel, not one field — but a signal all the same:
+            // inotify pushes file-change events, so an untouched config
+            // costs nothing (see `config_watch`'s doc comment, including
+            // why the debounce sleep is gated, not standing). Watches the
+            // path `main` resolved once at boot; an environment where no
+            // config path resolves at all gets no watcher, the same shape
+            // as the tray-menu arm below.
+            match &self.config_path {
+                Some(path) => config_watch::subscription(path).map(Message::Config),
+                None => Subscription::none(),
+            },
             window::open_events().map(Message::SurfaceOpened),
             window::close_events().map(Message::SurfaceClosed),
             // Stage 16's two dismissal signals (Escape, and a surface losing
@@ -1524,7 +2109,7 @@ impl Panel {
     fn view(&self, id: window::Id) -> Element<'_, Message> {
         match self.role(id) {
             SurfaceRole::Bar => self.bar_view(),
-            SurfaceRole::Island(kind) => self.island_view(kind),
+            SurfaceRole::Islands => self.islands_view(),
             SurfaceRole::Popover(kind) => self.popover_view(kind),
         }
     }
@@ -1543,35 +2128,168 @@ impl Panel {
     /// is the point).
     fn popover_view(&self, kind: PopoverKind) -> Element<'_, Message> {
         match kind {
-            PopoverKind::QuickSettings => {
-                popovers::quick_settings::view(&self.theme, &self.volume, &self.media)
-            }
+            PopoverKind::QuickSettings => popovers::quick_settings::view(
+                &self.theme,
+                &self.power,
+                &self.battery,
+                &self.network,
+                &self.bluetooth,
+                &self.volume,
+                &self.brightness,
+                &self.media,
+            ),
             PopoverKind::TrayMenu => popovers::tray_menu::view(&self.theme, &self.tray_menu),
+            PopoverKind::ClaudeUsage => {
+                // The rate-limit snapshot rides in from the module's state
+                // by value (it's `Copy`) — unlike the per-session rows it
+                // needs no click-time fetch, having already arrived by
+                // signal (see `modules::claude`'s schema section).
+                popovers::claude_usage::view(
+                    &self.theme,
+                    &self.claude_usage,
+                    self.claude_code.usage(),
+                )
+            }
         }
     }
 
-    /// Make an element open a popover when it is clicked.
+    /// The ledger bar's quick-settings trigger: the status cluster wrapped
+    /// in a `bare`-styled button with the same geometry as the mark's
+    /// (`mark::Mark::view` — `panel_pill_clock` tall, half-height
+    /// horizontal padding), so hovering the cluster reveals the same
+    /// subtle pill the mark shows. This replaced what used to be an
+    /// invisible `mouse_area` (a `popover_trigger` helper, since removed:
+    /// both layouts' triggers are buttons now — Jordan, 2026-08-01: the
+    /// cluster was clickable but nothing told you so). The islands
+    /// equivalent lives in `island_view`'s right arm, layered differently
+    /// because its cluster sits inside a visible ink pill.
     ///
-    /// [`mouse_area`] rather than a `button` on purpose: the status cluster
-    /// is bare ivory icons and text sitting *directly* on the ink surface
-    /// (CLAUDE.md's concept-4b rule — the clock is the *ledger* bar's only
-    /// solid pill, and in islands style nothing in the cluster is one),
-    /// so the trigger must add a hit target and **no** appearance at all. A
-    /// `button` would come with a background, a hover step and a focus ring,
-    /// none of which belong here; `mouse_area` draws nothing whatsoever.
+    /// `on_press` rather than `on_release` so the popover appears on the
+    /// way down, which is also what makes the dismissal ordering safe —
+    /// see `PopoverManager::update`'s note on why a trigger click can
+    /// never be undone by the focus-loss event that follows it.
     ///
-    /// `on_press` rather than `on_release` so the popover appears on the way
-    /// down, which is also what makes the dismissal ordering safe — see
-    /// `PopoverManager::update`'s note on why a trigger click can never be
-    /// undone by the focus-loss event that follows it.
-    fn popover_trigger<'a>(
-        &self,
-        content: impl Into<Element<'a, Message>>,
-        kind: PopoverKind,
+    /// Teaching note (a button *containing* buttons): the cluster's
+    /// modules include real buttons of their own — volume's mute toggle,
+    /// tray icons. Nesting them inside another button is safe for exactly
+    /// the reason nesting them inside a `mouse_area` was: iced's `button`
+    /// updates its content first and skips its own press handling when the
+    /// child captured the event (`iced_widget-0.14.2/src/button.rs:297`,
+    /// `shell.is_event_captured()` — the mirror image of
+    /// `mouse_area.rs:241`). So clicking the volume glyph still only
+    /// toggles mute; clicking anywhere else in the cluster opens quick
+    /// settings.
+    ///
+    /// The presence gate exists because a button has a footprint even when
+    /// its content is zero-sized: if every status module is absent
+    /// (no pulse, no battery, no services at all), wrapping the empty row
+    /// would leave an invisible 32px clickable circle at the bar's end
+    /// that opens an empty popover — the ledger-bar cousin of the "phantom
+    /// pill" `module_is_present` exists to prevent on islands. In that
+    /// case the bare (zero-sized, unclickable) row renders instead.
+    /// `modules` is the list `cluster` was actually built from — the
+    /// *split* right region since 2026-08-01 (see [`Panel::
+    /// right_region_split`]), not `config.right` wholesale, which now also
+    /// contains the standalone claude and tray groups this gate must not
+    /// count.
+    fn status_cluster_trigger<'a>(
+        &'a self,
+        modules: &[config::ModuleName],
+        cluster: iced::widget::Row<'a, Message>,
     ) -> Element<'a, Message> {
-        mouse_area(content)
-            .on_press(Message::Popover(popover::Message::Triggered(kind)))
-            .into()
+        let t = &self.theme;
+        if !modules.iter().any(|name| self.module_is_present(*name)) {
+            return cluster.into();
+        }
+        button(
+            // Same `Fill`/`Center` trick as the mark: the row of bare
+            // icons is shorter than the button, and only a container can
+            // centre it inside the fixed-height hit area.
+            container(cluster).height(Fill).align_y(iced::Center),
+        )
+        .height(t.sizes.panel_pill_clock)
+        .padding([0.0, t.sizes.panel_pill_clock / 2.0])
+        .style(style::button::bare(t, Surface::Ink))
+        .on_press(Message::Popover(popover::Message::Triggered(
+            PopoverKind::QuickSettings,
+        )))
+        .into()
+    }
+
+    /// The right region, split into its standalone groups (2026-08-01,
+    /// Jordan: the Claude Code dots are their own island immediately left
+    /// of the tray): everything in `config.right` *except* `claude` and
+    /// `tray` forms the status cluster (the quick-settings trigger),
+    /// while those two — wherever they appear in the list — each render
+    /// as their own group before it, in the fixed order (Jordan,
+    /// 2026-08-01, superseding the earlier status-first order):
+    /// claude, tray, status cluster. Claude gets its own trigger (the
+    /// usage popover) so a click on its dots can't mean quick settings;
+    /// tray icons are already their own buttons and need no trigger
+    /// wrapper at all.
+    ///
+    /// Returns `(status modules, claude listed, tray listed)` — the two
+    /// flags say "the config asked for it", and the callers still gate
+    /// each group on `module_is_present` so an absent module costs no gap
+    /// (ledger) and no pill (islands).
+    fn right_region_split(&self) -> (Vec<config::ModuleName>, bool, bool) {
+        let mut cluster = Vec::new();
+        let mut claude = false;
+        let mut tray = false;
+        for name in &self.config.right {
+            match name {
+                config::ModuleName::Claude => claude = true,
+                config::ModuleName::Tray => tray = true,
+                other => cluster.push(*other),
+            }
+        }
+        (cluster, claude, tray)
+    }
+
+    /// The ledger bar's claude group: the module's mark-and-dots view
+    /// wrapped in the same `bare`-styled, `panel_pill_clock`-tall hover
+    /// pill as [`Panel::status_cluster_trigger`] — but opening the usage
+    /// popover instead of quick settings. Only built when the module is
+    /// present (the caller's gate), so there is never an invisible
+    /// clickable pill over an empty spot.
+    fn claude_cluster_trigger(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        button(
+            container(self.module_view(config::ModuleName::Claude))
+                .height(Fill)
+                .align_y(iced::Center),
+        )
+        .height(t.sizes.panel_pill_clock)
+        .padding([0.0, t.sizes.panel_pill_clock / 2.0])
+        .style(style::button::bare(t, Surface::Ink))
+        .on_press(Message::Popover(popover::Message::Triggered(
+            PopoverKind::ClaudeUsage,
+        )))
+        .into()
+    }
+
+    /// The islands claude pill: its own solid-ink island, layered exactly
+    /// like the status island (ink `bar_pill` outside, `bare` trigger
+    /// button inside carrying the content padding, so the hover tint
+    /// paints over the ink — see `island_view`'s right-arm comment for why
+    /// that order matters), opening the usage popover.
+    fn claude_island_pill(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        let content = container(self.module_view(config::ModuleName::Claude))
+            .height(Fill)
+            .align_y(iced::Center);
+        container(
+            button(content)
+                .padding([0.0, t.sizes.panel_pill / 2.0])
+                .height(Fill)
+                .style(style::button::bare(t, Surface::Ink))
+                .on_press(Message::Popover(popover::Message::Triggered(
+                    PopoverKind::ClaudeUsage,
+                ))),
+        )
+        .style(style::container::bar_pill(t))
+        .height(Fill)
+        .into()
     }
 
     /// One module's rendered element, by config name — the "name → view
@@ -1590,17 +2308,30 @@ impl Panel {
     fn module_view(&self, name: config::ModuleName) -> Element<'_, Message> {
         let t = &self.theme;
         match name {
-            config::ModuleName::Mark => self.mark.view(t).map(Message::Mark),
+            // Mark and clock pass more than the theme: their *surface
+            // treatments* are style-dependent (the clock: solid ivory pill
+            // on the ledger bar, bare ivory text on an island; the mark:
+            // pill-shaped hover hit area on the bar, a button filling its
+            // island circle), so both are handed `config.style` as well. A
+            // deliberate, narrow exception to the layout seam — see
+            // `island_view`'s doc comment. `media` used to be the third
+            // (its muted-fill pill on the bar vs. a bare island button) —
+            // retired 2026-08-01 along with the pill itself: a bare status
+            // glyph looks the same either way, so `Media::view` no longer
+            // takes `config.style` at all.
+            config::ModuleName::Mark => self.mark.view(t, self.config.style).map(Message::Mark),
+            // Style-independent: bare quiet text either way. In islands mode
+            // the ink pill around it is `island_pill`'s (an island of its
+            // own beside the mark's — spec §7, amended 2026-08-01); the
+            // module itself draws plain text in both styles, which is why it
+            // never needs `config.style`.
+            config::ModuleName::WindowTitle => self.window_title.view(t).map(Message::WindowTitle),
             config::ModuleName::Mpris => self.media.view(t).map(Message::Media),
-            // The one arm that passes more than the theme: the clock's
-            // *surface treatment* is style-dependent (solid ivory pill on the
-            // ledger bar, bare ivory text on an island's scrim), so it is
-            // handed `config.style` as well. That is a deliberate, narrow
-            // exception to the layout seam — see `island_view`'s doc comment.
             config::ModuleName::Clock => self.clock.view(t, self.config.style).map(Message::Clock),
             config::ModuleName::NiriColumns => self.columns.view(t).map(Message::Columns),
             config::ModuleName::Volume => self.volume.view(t).map(Message::Volume),
             config::ModuleName::Network => self.network.view(t).map(Message::Network),
+            config::ModuleName::Bluetooth => self.bluetooth.view(t).map(Message::Bluetooth),
             config::ModuleName::Battery => self.battery.view(t).map(Message::Battery),
             config::ModuleName::Claude => self.claude_code.view(t).map(Message::ClaudeCode),
             config::ModuleName::Tray => self.tray.view(t).map(Message::Tray),
@@ -1623,11 +2354,13 @@ impl Panel {
     fn module_is_present(&self, name: config::ModuleName) -> bool {
         match name {
             config::ModuleName::Mark => self.mark.is_present(),
+            config::ModuleName::WindowTitle => self.window_title.is_present(),
             config::ModuleName::Mpris => self.media.is_present(),
             config::ModuleName::Clock => self.clock.is_present(),
             config::ModuleName::NiriColumns => self.columns.is_present(),
             config::ModuleName::Volume => self.volume.is_present(),
             config::ModuleName::Network => self.network.is_present(),
+            config::ModuleName::Bluetooth => self.bluetooth.is_present(),
             config::ModuleName::Battery => self.battery.is_present(),
             config::ModuleName::Claude => self.claude_code.is_present(),
             config::ModuleName::Tray => self.tray.is_present(),
@@ -1651,8 +2384,20 @@ impl Panel {
     /// replace the `island_gap` this method used to apply to all three —
     /// that token is the *islands-mode* gap (between free-standing island
     /// pills) and no longer belongs anywhere in the ledger bar.
+    ///
+    /// Absent modules are filtered out here (2026-08-01), not just rendered
+    /// as zero-sized `Space`s: iced's `Row` puts its `spacing` between
+    /// *every* pair of children regardless of their size, so a zero-sized
+    /// child still costs a full gap — an absent battery or tray used to
+    /// leave a phantom `bar_cluster_gap` in the ledger cluster while the
+    /// islands layout (which always filtered via `module_is_present`)
+    /// closed it. Filtering in the one method both layouts share is what
+    /// keeps the two spacing the same module list identically.
     fn region(&self, modules: &[config::ModuleName]) -> iced::widget::Row<'_, Message> {
-        row(modules.iter().map(|name| self.module_view(*name)))
+        row(modules
+            .iter()
+            .filter(|name| self.module_is_present(**name))
+            .map(|name| self.module_view(*name)))
     }
 
     /// The ledger bar itself — the `view` body as it stood before the daemon
@@ -1668,6 +2413,37 @@ impl Panel {
     fn bar_view(&self) -> Element<'_, Message> {
         let t = &self.theme;
 
+        // The right side's three groups (see `right_region_split`), in the
+        // fixed order claude, tray, status cluster — the claude and tray
+        // groups sit to the *left* of the status cluster (Jordan,
+        // 2026-08-01), which keeps the quick-settings trigger at the bar's
+        // trailing end. The first two are each gated on presence, so an
+        // absent group costs neither space nor a gap. `bar_element_gap`
+        // between groups, the same element-scale gap the left and centre
+        // regions use; the *cluster's* internal gap stays the wider
+        // `bar_cluster_gap`.
+        let (status_modules, claude_listed, tray_listed) = self.right_region_split();
+        let mut right = row![]
+            .spacing(t.sizes.bar_element_gap)
+            .align_y(iced::Center);
+        if claude_listed && self.claude_code.is_present() {
+            right = right.push(self.claude_cluster_trigger());
+        }
+        if tray_listed && self.tray.is_present() {
+            right = right.push(
+                self.region(&[config::ModuleName::Tray])
+                    .align_y(iced::Center),
+            );
+        }
+        right = right.push(
+            self.status_cluster_trigger(
+                &status_modules,
+                self.region(&status_modules)
+                    .spacing(t.sizes.bar_cluster_gap)
+                    .align_y(iced::Center),
+            ),
+        );
+
         // Ledger layout (Architecture in PLAN.md): the full five-element
         // row — left region, Fill spacer, center (clock), Fill spacer,
         // right region (status pills). The two Fill spacers split the
@@ -1677,67 +2453,113 @@ impl Panel {
         // acceptable for the ledger style. Keeping this outer row separate
         // from module code is what lets the future Islands layout swap in
         // later without touching any individual module.
-        container(row![
-            self.region(&self.config.left)
-                .spacing(t.sizes.bar_element_gap),
-            Space::new().width(Fill),
-            // `align_y(Center)` is what lines the niri-columns dashes up
-            // with the clock's baseline box — the outer container centres
-            // the row as a whole, not the items within it. Together with
-            // `spacing`, these are the region-specific modifiers
-            // `Panel::region` deliberately leaves to its caller.
-            self.region(&self.config.center)
-                .spacing(t.sizes.bar_element_gap)
-                .align_y(iced::Center),
-            Space::new().width(Fill),
-            // The status cluster gets its own, slightly wider gap — and, as
-            // of Stage 16, is the ledger bar's quick-settings trigger. The
-            // whole cluster is the hit target rather than one pill inside it:
-            // spec §7 calls the third island "status" as a unit, and the bar
-            // is the same modules in the same order.
-            self.popover_trigger(
-                self.region(&self.config.right)
-                    .spacing(t.sizes.bar_cluster_gap),
-                PopoverKind::QuickSettings,
-            ),
-        ])
+        // Every row here needs its own `align_y(Center)`: the outer
+        // container centres the five-element row as a *block*, but a row's
+        // cross-axis alignment defaults to `Start`, so without these the
+        // shorter regions (bare icons, ~15 px) would top-align against the
+        // row's height — which the clock pill (`panel_pill`, 40) sets.
+        // That applies at both levels: the outer row centres each region
+        // as a block, and each region centres the modules within it
+        // (mark's icon next to the window-title text, icon next to text in
+        // the status readouts).
+        container(
+            row![
+                self.region(&self.config.left)
+                    .spacing(t.sizes.bar_element_gap)
+                    .align_y(iced::Center),
+                Space::new().width(Fill),
+                self.region(&self.config.center)
+                    .spacing(t.sizes.bar_element_gap)
+                    .align_y(iced::Center),
+                Space::new().width(Fill),
+                // The split right side built above: status cluster (the
+                // quick-settings trigger — the whole cluster is the hit
+                // target, per spec §7's "status" unit), then the claude
+                // and tray groups.
+                right,
+            ]
+            .align_y(iced::Center),
+        )
         // The bar is a floating pill, not a flush strip: `bar_pill` is solid
         // ink at `radii.pill`, and `main`'s layer-shell margins are what
         // inset the surface from the screen edges (see there).
         .style(style::container::bar_pill(t))
-        // Horizontal padding = half the bar's height, i.e. the pill's own
-        // rounded-end radius — derived from a height rather than a magic
-        // number, exactly as the modules derive their own geometry. At
-        // `radii.pill` (999, clamped by iced to half the height) each end
-        // of the bar is a semicircle of that radius, so anything closer in
-        // than this would be sliced by the curve. `config.height(t)` rather
-        // than the `panel_bar` token so the padding tracks the *real* end
-        // radius when `panel.kdl` sets a custom `height` (the two agree at
-        // the default). This is *not* `config.margin` any more: that knob
-        // became the surface's inset from the screen edge (`main`), not
-        // padding inside the bar.
-        .padding([0.0, self.config.height(t) / 2.0])
+        // Horizontal padding = half the height *difference* between the
+        // bar and `panel_pill_clock`, not the bar's full rounded-end
+        // radius (half its height), because both ends now lead with a
+        // pill-shaped hit area of exactly that height — the mark's button
+        // on the left (`mark::Mark::view`), the status cluster's
+        // quick-settings button on the right (`status_cluster_trigger`) —
+        // and a smaller pill can tuck *into* a bigger pill's rounded end
+        // concentrically: inset by half the height difference, the two
+        // caps share a centre and the gap between their curves is that
+        // same half-difference all the way around — exactly the 8px those
+        // hit pills already get above and below them (Jordan, 2026-08-01:
+        // the old full-radius inset read as extra dead space outside the
+        // mark's hit area). The full radius would be needed again only for
+        // *square*-cornered content right at the bar's end; everything
+        // this bar can lead with is either pill-shaped (the hit-area
+        // buttons themselves) or small enough (a bare 15px glyph, centred)
+        // to clear the semicircle at this inset with room to spare.
+        // `config.height(t)`
+        // rather than the `panel_bar` token so the inset tracks the real
+        // geometry when `panel.kdl` sets a custom `height` (the two agree
+        // at the default). This is *not* `config.margin` any more: that
+        // knob became the surface's inset from the screen edge (`main`),
+        // not padding inside the bar.
+        .padding([
+            0.0,
+            (self.config.height(t) - t.sizes.panel_pill_clock) / 2.0,
+        ])
         .align_y(iced::Center)
         .width(Fill)
         .height(Fill)
         .into()
     }
 
-    /// One island — the whole of what `style "islands"` draws on one
-    /// surface: a *cluster* of translucent scrim pills floating over the
-    /// wallpaper, `island_gap` apart (that token's documented meaning: the
-    /// gap between pills).
+    /// The whole of what `style "islands"` draws on its one surface: the
+    /// three clusters stacked as layers of a single full-width element.
+    ///
+    /// `stack!` rather than the ledger's five-element row on purpose: each
+    /// `island_view` below is already a full-width transparent positioner
+    /// with its cluster pushed to the left / centre / right (the exact
+    /// layout the three per-surface islands had before they collapsed into
+    /// one surface — see `IslandKind`'s doc comment), so layering them
+    /// reproduces the old screen positions pixel for pixel. A row would
+    /// have re-introduced the ledger's "centre drifts by half the weight
+    /// difference" compromise; the stack keeps the centre island truly
+    /// centred, as its own surface used to. The clusters can in principle
+    /// overlap if a config crams enough modules in — iced hit-tests stack
+    /// layers top-down, so the rightmost listed layer wins clicks in any
+    /// overlap, matching how the topmost of the old overlapping surfaces
+    /// would have.
+    fn islands_view(&self) -> Element<'_, Message> {
+        stack![
+            self.island_view(IslandKind::Left),
+            self.island_view(IslandKind::Centre),
+            self.island_view(IslandKind::Right),
+        ]
+        .into()
+    }
+
+    /// One island cluster — one layer of [`Panel::islands_view`]'s stack:
+    /// solid ink pills floating over the wallpaper, `island_gap` apart
+    /// (that token's documented meaning: the gap between pills).
     ///
     /// # Pill grouping (listing 2a)
     ///
     /// The concept draws the left and centre clusters as one pill *per
-    /// module* — mark circle beside media pill, clock pill beside the
-    /// column-strip pill — because each is its own control. The right
-    /// cluster is the exception: spec §7 names it "status" as a *unit*,
-    /// and it is one pill acting as the single quick-settings trigger, so
-    /// its modules share a pill exactly as they share the ledger bar's
-    /// right region. Only modules that would actually draw something get a
-    /// pill (`module_is_present`) — no media player, no media pill.
+    /// module* — mark circle beside the window-title text, clock pill
+    /// beside the column-strip pill — because each is its own control. The
+    /// right cluster is the exception: spec §7 names it "status" as a
+    /// *unit*, and it is one pill acting as the single quick-settings
+    /// trigger, so its modules (media included, since 2026-08-01 — see
+    /// `modules::media`'s doc comment) share a pill exactly as they share
+    /// the ledger bar's right region. Only modules that would actually draw
+    /// something get a pill at all (`module_is_present`) — a left/centre
+    /// cluster whose one module is absent draws nothing; the shared status
+    /// pill just loses one glyph, the same way an absent battery or network
+    /// already does.
     ///
     /// # Why this can be so short (the layout seam, as amended)
     ///
@@ -1759,26 +2581,34 @@ impl Panel {
     /// wide am I" is layout and stays here, while "what am I sitting *on*,
     /// and therefore what may I be styled as" is the module's own to answer.
     ///
-    /// Exactly one module exercises that today: `modules::clock` is a solid
+    /// Two modules exercise that today. `modules::clock` is a solid
     /// ivory pill in ledger style (concept 4b, where it is the bar's only
     /// one) and bare ivory text in islands style (listing 2a — a pill inside
-    /// the translucent scrim would be a surface nested in a surface, and in
+    /// the island's ink would be a surface nested in a surface, and in
     /// this centre island the sole solid ivory element is the niri-columns
-    /// strip's focused dash). `Panel::module_view` passes `config.style` into
-    /// that one arm; every other module's `view` still takes the theme alone.
+    /// strip's focused dash). `modules::mark`'s launcher button is a
+    /// pill-shaped hover hit area on the ledger bar but a `Fill`-sized
+    /// button on islands, stretching to the ink circle `island_pill` pins
+    /// around it (see `Mark::view`'s doc comment). `Panel::module_view`
+    /// passes `config.style` into those two arms; every other module's
+    /// `view` — `modules::media` included, since it retired its own
+    /// per-style pill/button split on 2026-08-01 (a bare status glyph looks
+    /// identical directly on the bar's ink or inside an island's shared
+    /// status pill — see `Media::view`'s doc comment) — takes the theme
+    /// alone.
     ///
-    /// # Why the surface is wider than the pill
+    /// # Why the layer is wider than the pill
     ///
-    /// The surface spans the whole output; only this pill is visible on it,
-    /// and `align_x` is what puts the pill at the left margin, the centre,
-    /// or the right margin. The alternative — resizing each surface to track
-    /// its content's width — was rejected with reasons; the short version is
-    /// that iced 0.14 has no supported way to measure a laid-out widget
-    /// (`container::visible_bounds` is gone), and a measurement taken inside
-    /// a too-small surface is clipped by that surface, so a shrink-to-fit
-    /// loop could never grow back. See the Stage 15 handoff for the full
-    /// argument. The cost of the wide surface is input: see
-    /// `SurfaceGeometry::events_transparent`.
+    /// Each cluster's layer spans the whole strip; only its pills are
+    /// visible on it, and `align_x` is what puts them at the left margin,
+    /// the centre, or the right margin. (This full-width-positioner shape
+    /// dates from when each cluster was its own *surface* and sizing a
+    /// surface to its content was ruled out — iced 0.14 has no supported
+    /// way to measure a laid-out widget, see the Stage 15 handoff. As
+    /// stack layers the shape simply costs nothing now.) The strip surface
+    /// itself takes pointer input across its full width — see
+    /// `SurfaceGeometry`'s `events_transparent` field for what that
+    /// swallows and why it's acceptable.
     fn island_view(&self, kind: IslandKind) -> Element<'_, Message> {
         let t = &self.theme;
 
@@ -1812,36 +2642,96 @@ impl Panel {
         }
 
         let cluster: Element<'_, Message> = match kind {
-            // One scrim pill per module, `island_gap` between them — the
+            // One ink pill per module, `island_gap` between them — the
             // cluster the concept draws. `row(iterator)` for the same
             // runtime-length reason as `Panel::region`.
+            //
+            // The window title is one of these like any other (amended
+            // 2026-08-01: spec §7 now gives it "an island of its own" beside
+            // the mark's, retiring the first draft's shared mark + title
+            // pill). Its pill comes and goes with window focus — the
+            // `present` filter above is what leaves an unfocused desktop
+            // showing just the mark's circle, no empty ink beside it.
             IslandKind::Left | IslandKind::Centre => {
                 row(present.iter().map(|name| self.island_pill(*name)))
                     .spacing(t.sizes.island_gap)
                     .align_y(iced::Center)
                     .into()
             }
-            // The status cluster: one shared pill, and the islands
-            // layout's quick-settings trigger. Its *internal* gap is the
-            // ledger's `bar_cluster_gap` — deliberately shared, because
-            // this is the one place the two layouts draw the same thing
-            // (spec §7's "status" unit: the same readouts at the same
-            // rhythm, whichever chrome they sit in). The `mouse_area`
-            // wraps the pill, not the surface, so only the visible cluster
-            // reacts — even though the surface itself accepts pointer
-            // events across its whole width (see
-            // `SurfaceGeometry::events_transparent`).
+            // The right side's island *row* (2026-08-01, the same split as
+            // the ledger's — see `right_region_split`): the claude pill
+            // (its own island, its own trigger — the usage popover), then
+            // the tray's pill, then the shared status pill (the
+            // quick-settings trigger) at the trailing end — claude and
+            // tray sit left of the status island, same order as the
+            // ledger. `island_gap` apart like the left cluster's
+            // per-module pills.
+            //
+            // The status pill keeps the ledger's `bar_cluster_gap`
+            // internally — deliberately shared, because this is the one
+            // place the two layouts draw the same thing (spec §7's
+            // "status" unit: the same readouts at the same rhythm,
+            // whichever chrome they sit in). The trigger button wraps the
+            // pill, not the surface, so only the visible cluster reacts —
+            // even though the surface itself accepts pointer events across
+            // its whole width (see `SurfaceGeometry::events_transparent`).
+            //
+            // Layering (2026-08-01, hover-affordance parity with the
+            // ledger's `status_cluster_trigger`): the outer `container`
+            // draws the island's solid ink (`bar_pill`) and nothing else —
+            // no padding — while an inner `bare`-styled button fills it
+            // and carries the pill's content padding. The order matters:
+            // iced paints a container's background first and its content
+            // on top, so the button's hover fill (`fill_subtle` at
+            // `radii.pill`, the exact same rounded rect) lands *above* the
+            // ink and tints the whole pill on hover. Wrapping the ink pill
+            // in the button instead would paint the hover fill underneath
+            // the ink, where it could never be seen. Nesting the cluster's
+            // own buttons (volume, tray) inside this one is safe for the
+            // reason `status_cluster_trigger`'s teaching note gives —
+            // children update first, and a captured event stops here.
+            // `claude_island_pill` copies this exact layering.
             IslandKind::Right => {
-                let pill = container(
-                    self.region(&present)
-                        .spacing(t.sizes.bar_cluster_gap)
-                        .align_y(iced::Center),
-                )
-                .style(style::container::translucent_panel(t))
-                .padding([0.0, t.sizes.panel_pill / 2.0])
-                .height(Fill)
-                .align_y(iced::Center);
-                self.popover_trigger(pill, PopoverKind::QuickSettings)
+                let (status_modules, claude_listed, tray_listed) = self.right_region_split();
+                let mut pills: Vec<Element<'_, Message>> = Vec::new();
+
+                if claude_listed && self.claude_code.is_present() {
+                    pills.push(self.claude_island_pill());
+                }
+                if tray_listed && self.tray.is_present() {
+                    pills.push(self.island_pill(config::ModuleName::Tray));
+                }
+                if status_modules
+                    .iter()
+                    .any(|name| self.module_is_present(*name))
+                {
+                    let cluster = container(
+                        self.region(&status_modules)
+                            .spacing(t.sizes.bar_cluster_gap)
+                            .align_y(iced::Center),
+                    )
+                    .height(Fill)
+                    .align_y(iced::Center);
+                    pills.push(
+                        container(
+                            button(cluster)
+                                .padding([0.0, t.sizes.panel_pill / 2.0])
+                                .height(Fill)
+                                .style(style::button::bare(t, Surface::Ink))
+                                .on_press(Message::Popover(popover::Message::Triggered(
+                                    PopoverKind::QuickSettings,
+                                ))),
+                        )
+                        .style(style::container::bar_pill(t))
+                        .height(Fill)
+                        .into(),
+                    );
+                }
+
+                row(pills)
+                    .spacing(t.sizes.island_gap)
+                    .align_y(iced::Center)
+                    .into()
             }
         };
 
@@ -1851,7 +2741,8 @@ impl Panel {
         // cluster to the margin the island belongs at. The margin itself is
         // the layer-shell surface's, not padding here (see
         // `SurfaceGeometry::of`), so the cluster lands
-        // `panel_margin_islands` from the screen edge.
+        // `panel_margin_ledger` from the screen edge (the islands share the
+        // ledger's insets).
         container(cluster)
             .width(Fill)
             .height(Fill)
@@ -1861,24 +2752,30 @@ impl Panel {
 
     /// One free-standing island pill around one module's view.
     ///
-    /// The scrim pill: `container::translucent_panel` is the theme's
-    /// islands surface — an ink-tinted scrim at `radii.pill` that the
-    /// wallpaper shows through, the exact counterpart of the ledger bar's
-    /// opaque `container::bar_pill`. Zero local styling. Horizontal padding
-    /// is half the pill's height for the same reason as the ledger bar's:
-    /// that *is* the radius the rounded ends actually curve at (iced clamps
-    /// `radii.pill`'s 999 to half the height), so it is the closest content
-    /// can sit without being sliced by the curve.
+    /// The ink pill: `container::bar_pill` — the same solid ink at
+    /// `radii.pill` the ledger bar wears (Jordan, 2026-08-01: the islands
+    /// match the ledger panel; the translucent scrim treatment is retired
+    /// for the resting panel and kept for overlay states only — recorded in
+    /// the style guide's scrims section). Zero local styling. Horizontal
+    /// padding is half the pill's height for the same reason as the ledger
+    /// bar's: that *is* the radius the rounded ends actually curve at (iced
+    /// clamps `radii.pill`'s 999 to half the height), so it is the closest
+    /// content can sit without being sliced by the curve.
     ///
     /// The mark is the one differently-shaped pill: the concept draws it as
     /// a *circle* (a launcher button, not a readout), so instead of hugging
     /// its content plus padding it is pinned to `panel_pill` wide — equal to
     /// the pill height, which `radii.pill` then closes into a circle, the
-    /// same width-equals-height trick the strip's rest dashes use.
+    /// same width-equals-height trick the strip's rest dashes use. In
+    /// islands style the module's own view is a `Fill`-sized bare button
+    /// (see `Mark::view`), so the whole of this circle is the launcher's
+    /// hit target and its hover tint paints exactly over the circle's ink
+    /// — which is also why the mark arm sets no padding: the button fills
+    /// the pinned width edge to edge.
     fn island_pill(&self, name: config::ModuleName) -> Element<'_, Message> {
         let t = &self.theme;
         let pill = container(self.module_view(name))
-            .style(style::container::translucent_panel(t))
+            .style(style::container::bar_pill(t))
             .height(Fill)
             .align_y(iced::Center);
         match name {
@@ -1886,6 +2783,12 @@ impl Panel {
                 .width(t.sizes.panel_pill)
                 .align_x(Horizontal::Center)
                 .into(),
+            // Media used to special-case here too (a `Fill`-height `bare`
+            // button carrying its own content padding, like the mark) —
+            // retired 2026-08-01 along with its per-style pill/button split:
+            // media is now a status-cluster glyph, rendered through
+            // `island_view`'s Right arm rather than through this per-module
+            // pill at all (see `modules::media`'s doc comment).
             _ => pill.padding([0.0, t.sizes.panel_pill / 2.0]).into(),
         }
     }
@@ -1921,6 +2824,17 @@ fn fetch_tray_submenu(item_id: String, node_id: i32) -> Task<Message> {
     )
 }
 
+/// Read every session's transcript usage — the one-shot task
+/// `Panel::open_claude_usage` issues on the trigger click. Free function
+/// for the same reason as [`fetch_tray_menu`]: it needs nothing of `Panel`
+/// beyond the owned snapshot it is handed, which is what lets the returned
+/// `Task` be `'static`.
+fn fetch_claude_usage(targets: Vec<modules::claude::UsageTarget>) -> Task<Message> {
+    Task::perform(popovers::claude_usage::read_usage(targets), |sessions| {
+        Message::ClaudeUsage(popovers::claude_usage::Message::Loaded(sessions))
+    })
+}
+
 /// Tests for the surface registry — the only genuinely new logic Stage 13
 /// introduces. They construct a real `Panel` (cheap: `Theme::saola()` is
 /// plain data and every module's `default()` is an empty snapshot, so nothing
@@ -1931,12 +2845,25 @@ fn fetch_tray_submenu(item_id: String, node_id: i32) -> Task<Message> {
 mod tests {
     use super::*;
 
+    /// `Panel::new` with the given config, no CLI flags, no config path,
+    /// and the default theme — the constructor every test here goes
+    /// through, so the reload stage's extra parameters (runtime concerns
+    /// most tests don't exercise) are spelled out exactly once.
+    fn panel_with(config: config::PanelConfig) -> Panel {
+        Panel::new(
+            config,
+            config::CliOverrides::default(),
+            None,
+            Theme::saola(),
+        )
+    }
+
     /// The default config + default theme, exactly what an unconfigured
     /// `panel.kdl` boots into — the fixture every test in this module
     /// builds a `Panel` from, so a config-parsing bug can't silently change
     /// what these surface-registry tests are exercising.
     fn test_panel() -> Panel {
-        Panel::new(config::PanelConfig::default(), Theme::saola())
+        panel_with(config::PanelConfig::default())
     }
 
     #[test]
@@ -1970,14 +2897,14 @@ mod tests {
     #[test]
     fn surface_opened_does_not_clobber_a_pre_registered_role() {
         // Stage 15/16 shape: the role is recorded at spawn time, and the
-        // `Opened` event arrives afterwards. Stage 15 can state this in its
-        // strongest form now that a second role exists — a pre-registered
-        // island in a *ledger*-configured panel (whose boot role is `Bar`)
-        // must survive its own `Opened` event rather than being demoted to
-        // the boot role by an `insert`.
+        // `Opened` event arrives afterwards. Stated with a role that
+        // differs from the boot role — a pre-registered islands strip in a
+        // *ledger*-configured panel (whose boot role is `Bar`) must
+        // survive its own `Opened` event rather than being demoted to the
+        // boot role by an `insert`.
         let mut panel = test_panel();
         let id = window::Id::unique();
-        let role = SurfaceRole::Island(IslandKind::Left);
+        let role = SurfaceRole::Islands;
         panel.windows.insert(id, role);
 
         let _ = panel.update(Message::SurfaceOpened(id));
@@ -2040,20 +2967,19 @@ mod tests {
     #[test]
     fn module_view_handles_every_known_module_name_in_both_styles() {
         for style in [config::PanelStyle::Ledger, config::PanelStyle::Islands] {
-            let panel = Panel::new(
-                config::PanelConfig {
-                    style,
-                    ..config::PanelConfig::default()
-                },
-                Theme::saola(),
-            );
+            let panel = panel_with(config::PanelConfig {
+                style,
+                ..config::PanelConfig::default()
+            });
             for name in [
                 config::ModuleName::Mark,
+                config::ModuleName::WindowTitle,
                 config::ModuleName::Mpris,
                 config::ModuleName::Clock,
                 config::ModuleName::NiriColumns,
                 config::ModuleName::Volume,
                 config::ModuleName::Network,
+                config::ModuleName::Bluetooth,
                 config::ModuleName::Battery,
                 config::ModuleName::Claude,
                 config::ModuleName::Tray,
@@ -2082,7 +3008,7 @@ mod tests {
             right: vec![config::ModuleName::Battery, config::ModuleName::Volume],
             ..config::PanelConfig::default()
         };
-        let panel = Panel::new(config, Theme::saola());
+        let panel = panel_with(config);
         let _: Element<'_, Message> = panel.bar_view();
     }
 
@@ -2099,94 +3025,55 @@ mod tests {
     }
 
     fn islands_panel() -> Panel {
-        Panel::new(islands_config(), Theme::saola())
+        panel_with(islands_config())
     }
 
     /// The style decides what the boot surface *is*. This is the hinge the
     /// whole mode switch turns on: nothing else about `Settings` differs
-    /// between a bar and a centre island except the geometry derived from
-    /// this role.
+    /// between the bar and the islands strip except the geometry derived
+    /// from this role.
     #[test]
-    fn the_boot_surface_is_the_bar_in_ledger_style_and_the_centre_island_in_islands_style() {
+    fn the_boot_surface_is_the_bar_in_ledger_style_and_the_strip_in_islands_style() {
         assert_eq!(
             initial_role(&config::PanelConfig::default()),
             SurfaceRole::Bar
         );
-        assert_eq!(
-            initial_role(&islands_config()),
-            SurfaceRole::Island(IslandKind::Centre)
-        );
+        assert_eq!(initial_role(&islands_config()), SurfaceRole::Islands);
     }
 
     /// The unknown-Id fallback follows the style too — in islands mode the
     /// boot surface's first frame (rendered before its `Opened` event
-    /// arrives) must draw the centre island, not a full ledger bar.
+    /// arrives) must draw the islands strip, not a full ledger bar.
     #[test]
-    fn an_unknown_id_falls_back_to_the_centre_island_in_islands_style() {
+    fn an_unknown_id_falls_back_to_the_islands_strip_in_islands_style() {
         let panel = islands_panel();
-        assert_eq!(
-            panel.role(window::Id::unique()),
-            SurfaceRole::Island(IslandKind::Centre)
-        );
+        assert_eq!(panel.role(window::Id::unique()), SurfaceRole::Islands);
     }
 
-    /// Ledger style spawns nothing: the bar is the surface `Settings`
-    /// already created.
+    /// Neither style spawns anything at boot: the bar and the islands
+    /// strip are each the single surface `Settings` already created
+    /// (2026-08-01 — the islands' two extra per-cluster surfaces are gone;
+    /// see `IslandKind`'s doc comment for why the three collapsed into
+    /// one).
     #[test]
-    fn ledger_style_asks_for_no_extra_surfaces() {
-        let mut panel = test_panel();
-        let _ = panel.spawn_boot_surfaces();
-        assert!(panel.windows.is_empty());
+    fn neither_style_asks_for_extra_surfaces_at_boot() {
+        for mut panel in [test_panel(), islands_panel()] {
+            let _ = panel.spawn_boot_surfaces();
+            assert!(panel.windows.is_empty());
+        }
     }
 
-    /// Islands style spawns exactly the two islands the boot surface isn't,
-    /// and registers each one's role at spawn time — before the compositor
-    /// has created anything, which is what keeps `view` from ever seeing an
-    /// island Id it can't classify.
-    #[test]
-    fn islands_style_asks_for_the_left_and_right_islands_at_boot() {
-        let mut panel = islands_panel();
-
-        let _ = panel.spawn_boot_surfaces();
-
-        assert_eq!(panel.windows.len(), 2, "left and right, but not centre");
-        let mut roles: Vec<SurfaceRole> = panel.windows.values().copied().collect();
-        roles.sort_by_key(|role| format!("{role:?}"));
-        assert_eq!(
-            roles,
-            vec![
-                SurfaceRole::Island(IslandKind::Left),
-                SurfaceRole::Island(IslandKind::Right),
-            ]
-        );
-    }
-
-    /// Together with the boot surface, that is three islands — the deviation
-    /// from spec §7's four (no notifications island this phase) stated as an
-    /// assertion so it can't drift silently.
-    #[test]
-    fn islands_style_ends_up_with_three_surfaces_in_total() {
-        let mut panel = islands_panel();
-        let _ = panel.spawn_boot_surfaces();
-        // The boot surface reports itself once the compositor has it.
-        let boot_id = window::Id::unique();
-        let _ = panel.update(Message::SurfaceOpened(boot_id));
-
-        assert_eq!(panel.windows.len(), 3);
-        assert_eq!(
-            panel.windows.get(&boot_id),
-            Some(&SurfaceRole::Island(IslandKind::Centre))
-        );
-    }
-
-    /// Every island draws, for every kind — the islands counterpart of
+    /// Every island cluster draws, for every kind — and the stacked
+    /// composition of all three (the islands strip's whole view) draws too:
+    /// the islands counterpart of
     /// `bar_view_renders_the_default_module_lists_without_panicking`.
     #[test]
-    fn island_view_renders_every_island_without_panicking() {
+    fn island_view_renders_every_cluster_without_panicking() {
         let panel = islands_panel();
         for kind in [IslandKind::Left, IslandKind::Centre, IslandKind::Right] {
             let _: Element<'_, Message> = panel.island_view(kind);
         }
+        let _: Element<'_, Message> = panel.islands_view();
     }
 
     /// The presence seam at boot: every service-backed module starts
@@ -2202,15 +3089,60 @@ mod tests {
             (config::ModuleName::Mark, true),
             (config::ModuleName::Clock, true),
             (config::ModuleName::Mpris, false),
+            // No niri event has arrived, so no window is focused yet.
+            (config::ModuleName::WindowTitle, false),
             (config::ModuleName::NiriColumns, false),
             (config::ModuleName::Volume, false),
             (config::ModuleName::Network, false),
+            (config::ModuleName::Bluetooth, false),
             (config::ModuleName::Battery, false),
             (config::ModuleName::Claude, false),
             (config::ModuleName::Tray, false),
         ] {
             assert_eq!(panel.module_is_present(name), expected, "{name:?}");
         }
+    }
+
+    /// A panel with a focused window draws its title in both layouts — the
+    /// ledger bar's left region, and the islands' left cluster as an island
+    /// of its own beside the mark's (spec §7, amended 2026-08-01). `Element`
+    /// can't be introspected, so what this pins is that both composition
+    /// paths build without panicking once the module is actually present
+    /// (the boot state, where it isn't, is covered by
+    /// `only_serviceless_modules_are_present_at_boot`).
+    #[test]
+    fn a_focused_title_draws_in_both_layouts() {
+        for config in [config::PanelConfig::default(), islands_config()] {
+            let mut panel = panel_with(config);
+            panel
+                .window_title
+                .update(modules::window_title::Message::Updated(Some(
+                    "nvim — src/main.rs".to_owned(),
+                )));
+            assert!(panel.module_is_present(config::ModuleName::WindowTitle));
+            let _: Element<'_, Message> = panel.bar_view();
+            let _: Element<'_, Message> = panel.island_view(IslandKind::Left);
+        }
+    }
+
+    /// A config that asks for a title but no mark (`mark "none"`) still
+    /// draws the title. Once a fallback (when the title rode inside the
+    /// mark's pill and needed somewhere to go without one), now just the
+    /// normal path — the title's island never depended on the mark's being
+    /// present — but the config shape is real enough to keep pinned.
+    #[test]
+    fn a_titled_island_with_no_mark_still_draws_the_title() {
+        let mut panel = panel_with(config::PanelConfig {
+            mark: config::MarkSource::None,
+            ..islands_config()
+        });
+        panel
+            .window_title
+            .update(modules::window_title::Message::Updated(Some(
+                "Alacritty".to_owned(),
+            )));
+        assert!(!panel.module_is_present(config::ModuleName::Mark));
+        let _: Element<'_, Message> = panel.island_view(IslandKind::Left);
     }
 
     /// An island whose module list is explicitly empty (`left { }` in
@@ -2221,115 +3153,96 @@ mod tests {
             left: vec![],
             ..islands_config()
         };
-        let panel = Panel::new(config, Theme::saola());
+        let panel = panel_with(config);
         // No panic, and (not assertable through `Element`) no pill: the
         // early return in `island_view` is what this pins down.
         let _: Element<'_, Message> = panel.island_view(IslandKind::Left);
     }
 
-    /// The islands' own geometry: a `panel_pill`-tall strip stretched to the
-    /// output's width, on the `Top` layer and never taking the keyboard. The
-    /// centre island is inset by `panel_margin_islands`; the left/right
-    /// islands are zone-respecting surfaces placed below the centre's
-    /// reservation, so their edge margin is `margin − strip` = `−panel_pill`
-    /// (−40) — which lands them on the same strip. See `SurfaceGeometry::of`.
+    /// The islands strip's own geometry: a `panel_pill`-tall strip
+    /// stretched to the output's width, on the `Top` layer and never
+    /// taking the keyboard, sharing the **ledger** insets —
+    /// `panel_margin_ledger` (20) at the sides, `panel_margin_ledger_top`
+    /// (18) at the anchored edge (the uniform `panel_margin_islands` 26 is
+    /// retired, as is the per-cluster negative-margin arithmetic the old
+    /// three-surface layout needed). See `SurfaceGeometry::of`.
     #[test]
-    fn island_geometry_comes_from_the_islands_tokens() {
+    fn island_geometry_matches_the_ledger_insets() {
         let theme = Theme::saola();
         let config = islands_config();
-        let margin = theme.sizes.panel_margin_islands as i32;
-        let strip = (theme.sizes.panel_pill as i32) + margin;
+        let side = theme.sizes.panel_margin_ledger as i32;
+        let edge_margin = theme.sizes.panel_margin_ledger_top as i32;
 
-        for kind in [IslandKind::Left, IslandKind::Centre, IslandKind::Right] {
-            let geometry = SurfaceGeometry::of(SurfaceRole::Island(kind), &config, &theme);
+        let geometry = SurfaceGeometry::of(SurfaceRole::Islands, &config, &theme);
 
-            let edge = match kind {
-                IslandKind::Centre => margin,
-                _ => margin - strip,
-            };
-            assert_eq!(geometry.size, (0, theme.sizes.panel_pill as u32));
-            assert_eq!(geometry.margin, (edge, margin, 0, margin));
-            assert_eq!(geometry.anchor, Anchor::Top | Anchor::Left | Anchor::Right);
-            assert_eq!(geometry.layer, Layer::Top);
-            assert_eq!(geometry.keyboard_interactivity, KeyboardInteractivity::None);
-        }
-
-        // The invariant the negative margin exists for: every island's final
-        // position (reservation baseline + margin) is the same strip.
-        let centre_top = margin;
-        let sibling_top = strip + (margin - strip);
-        assert_eq!(centre_top, sibling_top);
+        assert_eq!(geometry.size, (0, theme.sizes.panel_pill as u32));
+        assert_eq!(geometry.margin, (edge_margin, side, 0, side));
+        assert_eq!(geometry.anchor, Anchor::Top | Anchor::Left | Anchor::Right);
+        assert_eq!(geometry.layer, Layer::Top);
+        assert_eq!(geometry.keyboard_interactivity, KeyboardInteractivity::None);
     }
 
-    /// Input transparency is **not** uniform across the islands as of Stage
-    /// 16: the right island carries the quick-settings trigger, and
-    /// `events_transparent` is all-or-nothing per surface and fixed at
-    /// creation time, so it has to accept pointer events for its whole
-    /// full-width strip. The other two stay click-through, which is what
-    /// keeps three overlapping full-width surfaces from fighting over the
-    /// pointer.
+    /// The islands strip accepts pointer events across its full width,
+    /// exactly like the ledger bar — the point of collapsing the three
+    /// per-cluster surfaces into one (2026-08-01, see `IslandKind`'s doc
+    /// comment): when only the right of three overlapping surfaces could
+    /// take input, the mark's launcher and media's play/pause sat on
+    /// surfaces the compositor never sent a click to.
     #[test]
-    fn only_the_island_with_the_trigger_takes_pointer_events() {
+    fn the_islands_strip_takes_pointer_events() {
         let theme = Theme::saola();
-        let config = islands_config();
-        let transparent = |kind| {
-            SurfaceGeometry::of(SurfaceRole::Island(kind), &config, &theme).events_transparent
-        };
-
-        assert!(transparent(IslandKind::Left));
-        assert!(transparent(IslandKind::Centre));
+        let geometry = SurfaceGeometry::of(SurfaceRole::Islands, &islands_config(), &theme);
         assert!(
-            !transparent(IslandKind::Right),
-            "the status island is the islands layout's popover trigger and \
-             must receive clicks"
+            !geometry.events_transparent,
+            "every cluster's controls — mark, media, quick-settings trigger \
+             — live on this one surface, so it must receive clicks"
         );
     }
 
-    /// The exclusive zone is the centre island's alone. `-1` on the other
-    /// two is not "no zone" — it is "don't move me out of anyone else's",
-    /// without which the compositor would push the left and right islands
-    /// below the centre's own reservation.
+    /// The islands strip reserves its own zone the same way the bar does:
+    /// height plus one edge margin as the bottom gap. (The old per-cluster
+    /// surfaces split this — centre reserved, siblings rode along at zone
+    /// 0 with a negative-margin re-level; one surface needs none of that.)
     #[test]
-    fn only_the_centre_island_reserves_an_exclusive_zone() {
+    fn the_islands_strip_reserves_an_exclusive_zone() {
         let theme = Theme::saola();
-        let config = islands_config();
-        let zone =
-            |kind| SurfaceGeometry::of(SurfaceRole::Island(kind), &config, &theme).exclusive_zone;
-
-        assert_eq!(zone(IslandKind::Centre), theme.sizes.panel_pill as i32);
+        let geometry = SurfaceGeometry::of(SurfaceRole::Islands, &islands_config(), &theme);
         assert_eq!(
-            zone(IslandKind::Left),
-            0,
-            "a sibling island must respect foreign bars' zones (waybar bug) \
-             — its negative edge margin re-levels it with the centre"
+            geometry.exclusive_zone,
+            theme.sizes.panel_pill as i32 + theme.sizes.panel_margin_ledger_top as i32,
+            "the strip reserves its height plus the bottom gap"
         );
-        assert_eq!(zone(IslandKind::Right), 0);
     }
 
-    /// The centre island reserves the same total as the ledger bar does:
-    /// the zone we pass plus the anchored-edge margin the compositor adds
-    /// itself (measured on niri: 40 + 26 == 48 + 18 == 66).
+    /// Both panel surfaces keep a bottom gap equal to their top margin:
+    /// the reserved strip (zone we pass + the anchored-edge margin the
+    /// compositor adds itself) is `height + 2 × edge margin` — 84 for the
+    /// ledger bar (48+18+18), 76 for the islands strip (40+18+18). The gap
+    /// below the panel therefore equals the gap above it, which is the
+    /// point of the 2026-08-01 change.
     #[test]
-    fn islands_and_the_ledger_bar_reserve_the_same_strip() {
+    fn panel_surfaces_reserve_a_bottom_gap_equal_to_the_top_margin() {
         let theme = Theme::saola();
 
         let bar = SurfaceGeometry::of(SurfaceRole::Bar, &config::PanelConfig::default(), &theme);
-        let centre = SurfaceGeometry::of(
-            SurfaceRole::Island(IslandKind::Centre),
-            &islands_config(),
-            &theme,
-        );
+        let islands = SurfaceGeometry::of(SurfaceRole::Islands, &islands_config(), &theme);
 
         let reserved = |g: SurfaceGeometry| g.exclusive_zone + g.margin.0;
-        assert_eq!(reserved(bar), 66);
-        assert_eq!(reserved(centre), 66);
+        assert_eq!(reserved(bar), 84);
+        assert_eq!(reserved(islands), 76);
+
+        // Stated as the invariant, not just the numbers: strip − (top
+        // margin + height) == top margin, i.e. bottom gap == top gap.
+        for g in [bar, islands] {
+            assert_eq!(reserved(g) - (g.margin.0 + g.size.1 as i32), g.margin.0);
+        }
     }
 
-    /// The ledger bar's geometry is untouched by this stage: still the
-    /// `panel_bar` height, still the asymmetric ledger margins, still
-    /// opaque to input.
+    /// The ledger bar's geometry: the `panel_bar` height, the asymmetric
+    /// ledger margins, opaque to input — and, since 2026-08-01, a zone of
+    /// height + one edge margin (the bottom gap).
     #[test]
-    fn the_ledger_bar_geometry_is_unchanged() {
+    fn the_ledger_bar_geometry_uses_the_ledger_tokens() {
         let theme = Theme::saola();
         let geometry =
             SurfaceGeometry::of(SurfaceRole::Bar, &config::PanelConfig::default(), &theme);
@@ -2344,7 +3257,10 @@ mod tests {
                 theme.sizes.panel_margin_ledger as i32,
             )
         );
-        assert_eq!(geometry.exclusive_zone, theme.sizes.panel_bar as i32);
+        assert_eq!(
+            geometry.exclusive_zone,
+            theme.sizes.panel_bar as i32 + theme.sizes.panel_margin_ledger_top as i32
+        );
         assert!(!geometry.events_transparent);
     }
 
@@ -2356,10 +3272,7 @@ mod tests {
 
         for (style, role) in [
             (config::PanelStyle::Ledger, SurfaceRole::Bar),
-            (
-                config::PanelStyle::Islands,
-                SurfaceRole::Island(IslandKind::Left),
-            ),
+            (config::PanelStyle::Islands, SurfaceRole::Islands),
         ] {
             let config = config::PanelConfig {
                 style,
@@ -2373,11 +3286,7 @@ mod tests {
                 Anchor::Bottom | Anchor::Left | Anchor::Right
             );
             assert_eq!(geometry.margin.0, 0, "nothing above a bottom panel");
-            assert_ne!(
-                geometry.margin.2, 0,
-                "the inset (positive for reserving surfaces, negative for \
-                 the zone-respecting sibling islands) moved to the bottom"
-            );
+            assert_ne!(geometry.margin.2, 0, "the edge inset moved to the bottom");
         }
     }
 
@@ -2391,48 +3300,46 @@ mod tests {
             ..islands_config()
         };
 
-        let geometry =
-            SurfaceGeometry::of(SurfaceRole::Island(IslandKind::Centre), &config, &theme);
+        let geometry = SurfaceGeometry::of(SurfaceRole::Islands, &config, &theme);
 
         assert_eq!(geometry.size, (0, 52));
-        assert_eq!(geometry.exclusive_zone, 52);
+        assert_eq!(
+            geometry.exclusive_zone,
+            52 + theme.sizes.panel_margin_ledger_top as i32
+        );
     }
 
     /// Spawned surfaces carry their geometry through to the settings the
     /// runtime actually spawns from — in particular the `Option` fields,
     /// where `None` would silently mean "leave the protocol default"
-    /// (a 0 exclusive zone is *not* the same as -1).
+    /// rather than "pass this value".
     #[test]
-    fn spawn_settings_carry_the_geometry_including_the_negative_margin() {
+    fn spawn_settings_carry_the_geometry() {
         let theme = Theme::saola();
-        let geometry = SurfaceGeometry::of(
-            SurfaceRole::Island(IslandKind::Left),
-            &islands_config(),
-            &theme,
-        );
+        let geometry = SurfaceGeometry::of(SurfaceRole::Islands, &islands_config(), &theme);
 
         let settings = geometry.new_layer_shell_settings();
 
         assert_eq!(settings.size, Some(geometry.size));
         assert_eq!(settings.margin, Some(geometry.margin));
-        assert!(geometry.margin.0 < 0, "the re-levelling margin is negative");
-        assert_eq!(settings.exclusive_zone, Some(0));
+        assert_eq!(settings.exclusive_zone, Some(geometry.exclusive_zone));
         assert_eq!(settings.anchor, geometry.anchor);
-        assert!(settings.events_transparent);
+        assert!(!settings.events_transparent);
         assert_eq!(settings.keyboard_interactivity, KeyboardInteractivity::None);
     }
 
     // ---- Stage 16: popover infrastructure -------------------------------
 
-    /// The spec's popover placement, as arithmetic: `sizes.popover_width`
-    /// wide, `sizes.popover_top` below the screen edge *once the panel's own
-    /// 66 px reservation is counted*, anchored to that edge and the
-    /// right-hand side.
+    /// The popover placement, as arithmetic: `sizes.popover_width` wide,
+    /// anchored to the panel's edge and the right-hand side, its edge
+    /// margin the clamped gap `max(0, popover_top − strip)` — 0 since the
+    /// bottom-gap change, because the panel's reserved strip (84 ledger /
+    /// 76 islands) already passes `popover_top` (72), so the popover sits
+    /// flush against the strip: one edge margin below the panel.
     ///
     /// The `0` exclusive zone is the load-bearing part. It makes the
     /// compositor place the popover below **every** reservation on the
-    /// output — the panel's and any foreign bar's — so its edge margin is
-    /// the 6 px *gap* (`popover_top − strip`), not the literal token. See
+    /// output — the panel's and any foreign bar's. See
     /// `SurfaceGeometry::of`'s doc comment for the full derivation and for
     /// why the original `-1` version broke next to waybar.
     #[test]
@@ -2440,8 +3347,13 @@ mod tests {
         let theme = Theme::saola();
         let role = SurfaceRole::Popover(PopoverKind::QuickSettings);
 
-        for config in [config::PanelConfig::default(), islands_config()] {
+        for (config, panel_role) in [
+            (config::PanelConfig::default(), SurfaceRole::Bar),
+            (islands_config(), SurfaceRole::Islands),
+        ] {
             let geometry = SurfaceGeometry::of(role, &config, &theme);
+            let panel = SurfaceGeometry::of(panel_role, &config, &theme);
+            let strip = panel.exclusive_zone + panel.margin.0;
 
             assert_eq!(geometry.anchor, Anchor::Top | Anchor::Right);
             assert_eq!(
@@ -2451,7 +3363,10 @@ mod tests {
                     PopoverKind::QuickSettings.height(&theme) as u32,
                 )
             );
-            assert_eq!(geometry.margin.0, theme.sizes.popover_top as i32 - 66);
+            assert_eq!(
+                geometry.margin.0,
+                (theme.sizes.popover_top as i32 - strip).max(0)
+            );
             assert_eq!(geometry.margin.1, config.margin(&theme) as i32);
             assert_eq!(geometry.margin.2, 0);
             assert_eq!(
@@ -2469,11 +3384,9 @@ mod tests {
         }
     }
 
-    /// Spec §6's "26px from the relevant edge" is the islands margin token —
-    /// stated as an assertion so the identity can't drift if either moves.
-    /// In ledger style the popover instead lines up with the bar's own end
-    /// (20), which is the deliberate deviation `SurfaceGeometry::of`
-    /// documents.
+    /// The popover lines up with the end of the panel it hangs from —
+    /// `panel_margin_ledger` (20) in both styles now that the islands share
+    /// the ledger's insets.
     #[test]
     fn the_popover_side_inset_follows_the_panel_it_hangs_from() {
         let theme = Theme::saola();
@@ -2487,22 +3400,22 @@ mod tests {
             .1
         };
 
-        assert_eq!(side(&islands_config()), 26);
+        assert_eq!(side(&islands_config()), 20);
         assert_eq!(side(&config::PanelConfig::default()), 20);
     }
 
     /// The popover clears the panel rather than overlapping its trigger
-    /// (spec §6). The panel reserves `exclusive_zone + edge margin` = 66 px
-    /// in both styles (measured on niri in Stage 15); the popover is a
-    /// zone-respecting surface placed below that reservation, plus a strictly
-    /// positive gap: `popover_top` (72) − strip (66) = 6.
+    /// (spec §6). The panel's reserved strip now *contains* the bottom gap,
+    /// so the popover (a zone-respecting surface placed below that
+    /// reservation, gap clamped to 0) starts exactly one edge margin below
+    /// the panel's bottom edge — the same separation tiled windows get.
     #[test]
     fn the_popover_starts_below_the_panel_strip() {
         let theme = Theme::saola();
 
         for (config, panel_role) in [
             (config::PanelConfig::default(), SurfaceRole::Bar),
-            (islands_config(), SurfaceRole::Island(IslandKind::Centre)),
+            (islands_config(), SurfaceRole::Islands),
         ] {
             let panel = SurfaceGeometry::of(panel_role, &config, &theme);
             let popover = SurfaceGeometry::of(
@@ -2512,16 +3425,12 @@ mod tests {
             );
 
             let panel_strip = panel.exclusive_zone + panel.margin.0;
-            assert_eq!(panel_strip, 66);
-            assert_eq!(
-                popover.margin.0,
-                theme.sizes.popover_top as i32 - panel_strip,
-                "the gap below the panel is popover_top minus the strip the \
-                 panel reserves"
-            );
+            let popover_top = panel_strip + popover.margin.0;
+            let panel_bottom = panel.margin.0 + panel.size.1 as i32;
             assert!(
-                popover.margin.0 > 0,
-                "the popover must never overlap the control that opened it"
+                popover_top >= panel_bottom + panel.margin.0,
+                "the popover must sit at least one edge margin below the \
+                 panel, never overlapping the control that opened it"
             );
         }
     }
@@ -2563,9 +3472,14 @@ mod tests {
             &theme,
         );
 
+        let panel = SurfaceGeometry::of(SurfaceRole::Bar, &config, &theme);
+        let strip = panel.exclusive_zone + panel.margin.2;
         assert_eq!(geometry.anchor, Anchor::Bottom | Anchor::Right);
         assert_eq!(geometry.margin.0, 0);
-        assert_eq!(geometry.margin.2, theme.sizes.popover_top as i32 - 66);
+        assert_eq!(
+            geometry.margin.2,
+            (theme.sizes.popover_top as i32 - strip).max(0)
+        );
     }
 
     /// The popover's distinguishing settings survive the trip into the
@@ -2702,7 +3616,7 @@ mod tests {
         assert_eq!(panel.windows.len(), 1, "the next click must reopen it");
     }
 
-    /// Both layouts render their trigger. The `mouse_area` wrapping is
+    /// Both layouts render their trigger. The trigger-button wrapping is
     /// invisible to the widget tree's *type*, so what this really pins is
     /// that neither `bar_view` nor `island_view` panics once the status
     /// cluster stops being a plain row.
@@ -2715,6 +3629,125 @@ mod tests {
         for kind in [IslandKind::Left, IslandKind::Centre, IslandKind::Right] {
             let _: Element<'_, Message> = islands.island_view(kind);
         }
+    }
+
+    // ---- The Claude Code usage popover ----------------------------------
+
+    /// One loaded row, transcript-less — enough shape for the apply/discard
+    /// tests below.
+    fn usage_fixture() -> Vec<popovers::claude_usage::SessionUsage> {
+        vec![popovers::claude_usage::SessionUsage {
+            target: modules::claude::UsageTarget {
+                id: "aaaaaaaa-1111".to_string(),
+                status: saola_theme::style::container::SessionStatus::Done,
+                transcript: None,
+            },
+            usage: None,
+        }]
+    }
+
+    /// The claude group's trigger opens exactly one popover surface, in the
+    /// `ClaudeUsage` role — and a second click closes it, same lifecycle as
+    /// every other trigger.
+    #[test]
+    fn the_claude_trigger_toggles_a_usage_popover_surface() {
+        let mut panel = test_panel();
+        let trigger = || Message::Popover(popover::Message::Triggered(PopoverKind::ClaudeUsage));
+
+        let _ = panel.update(trigger());
+        assert_eq!(panel.windows.len(), 1);
+        assert_eq!(
+            panel.windows.values().next(),
+            Some(&SurfaceRole::Popover(PopoverKind::ClaudeUsage))
+        );
+
+        let _ = panel.update(trigger());
+        assert!(panel.windows.is_empty());
+    }
+
+    /// A transcript read applies only while the usage popover is still the
+    /// open one — a read landing after dismissal is discarded, the same
+    /// staleness guard as `TrayMenu::Loaded`'s.
+    #[test]
+    fn a_usage_read_applies_only_while_the_popover_is_open() {
+        let mut panel = test_panel();
+        let trigger = || Message::Popover(popover::Message::Triggered(PopoverKind::ClaudeUsage));
+
+        let _ = panel.update(trigger());
+        let _ = panel.update(Message::ClaudeUsage(
+            popovers::claude_usage::Message::Loaded(usage_fixture()),
+        ));
+        assert_eq!(panel.claude_usage.sessions().len(), 1);
+
+        // Close it; a straggler read must not resurrect the state.
+        let _ = panel.update(trigger());
+        let _ = panel.update(Message::ClaudeUsage(
+            popovers::claude_usage::Message::Loaded(usage_fixture()),
+        ));
+        assert!(panel.claude_usage.sessions().is_empty());
+    }
+
+    /// The global one-open-at-a-time rule covers the new kind too.
+    #[test]
+    fn the_usage_popover_and_quick_settings_displace_each_other() {
+        let mut panel = test_panel();
+        let _ = panel.update(Message::Popover(popover::Message::Triggered(
+            PopoverKind::QuickSettings,
+        )));
+
+        let _ = panel.update(Message::Popover(popover::Message::Triggered(
+            PopoverKind::ClaudeUsage,
+        )));
+
+        assert_eq!(panel.windows.len(), 1);
+        assert_eq!(
+            panel.windows.values().next(),
+            Some(&SurfaceRole::Popover(PopoverKind::ClaudeUsage))
+        );
+    }
+
+    /// A usage-popover surface renders its content — the `popover_view`
+    /// arm for the new kind.
+    #[test]
+    fn a_registered_usage_popover_surface_renders() {
+        let mut panel = test_panel();
+        let id = window::Id::unique();
+        panel
+            .windows
+            .insert(id, SurfaceRole::Popover(PopoverKind::ClaudeUsage));
+        let _: Element<'_, Message> = panel.view(id);
+    }
+
+    /// The right region's split: `claude` and `tray` leave the status
+    /// cluster wherever the config listed them; everything else stays, in
+    /// order.
+    #[test]
+    fn the_right_region_split_extracts_claude_and_tray() {
+        let panel = test_panel();
+        let (cluster, claude_listed, tray_listed) = panel.right_region_split();
+        assert_eq!(
+            cluster,
+            vec![
+                config::ModuleName::Mpris,
+                config::ModuleName::Volume,
+                config::ModuleName::Network,
+                config::ModuleName::Bluetooth,
+                config::ModuleName::Battery,
+            ]
+        );
+        assert!(claude_listed);
+        assert!(tray_listed);
+
+        // A config that drops them reports them unlisted — no phantom
+        // trigger group for a module the user removed.
+        let trimmed = panel_with(config::PanelConfig {
+            right: vec![config::ModuleName::Battery],
+            ..config::PanelConfig::default()
+        });
+        let (cluster, claude_listed, tray_listed) = trimmed.right_region_split();
+        assert_eq!(cluster, vec![config::ModuleName::Battery]);
+        assert!(!claude_listed);
+        assert!(!tray_listed);
     }
 
     // ---- Stage 21: tray menus via popovers ------------------------------
@@ -2924,5 +3957,185 @@ mod tests {
             popovers::tray_menu::Message::ToggleSubmenu(SUBMENU_ROW_ID),
         ));
         assert!(!panel.tray_menu.is_expanded(SUBMENU_ROW_ID));
+    }
+
+    // ---- Live config reload ---------------------------------------------
+
+    /// Drive a reload the way the watcher would: through `Panel::update`
+    /// with the watcher's own message, so these tests pin the routing as
+    /// well as `reload_config` itself.
+    fn reload(panel: &mut Panel, config: config::PanelConfig) -> Task<Message> {
+        panel.update(Message::Config(config_watch::Message::Reloaded(config)))
+    }
+
+    /// The config swaps wholesale, and the state that was *copied out of*
+    /// it at boot follows: the mark's launcher here (rebuilt), the module
+    /// lists by way of `self.config` (read live by `view`, so the swap is
+    /// enough).
+    #[test]
+    fn a_reload_swaps_the_config_and_rebuilds_the_config_fed_modules() {
+        let mut panel = test_panel();
+        assert_eq!(panel.mark.launcher(), Some(config::DEFAULT_LAUNCHER));
+
+        let _ = reload(
+            &mut panel,
+            config::PanelConfig {
+                launcher: Some("wofi --show drun".to_owned()),
+                right: vec![config::ModuleName::Battery],
+                ..config::PanelConfig::default()
+            },
+        );
+
+        assert_eq!(panel.config.right, vec![config::ModuleName::Battery]);
+        assert_eq!(panel.mark.launcher(), Some("wofi --show drun"));
+        // And the new layout renders — the same no-panic proof the boot
+        // config gets.
+        let _: Element<'_, Message> = panel.bar_view();
+    }
+
+    /// A reloaded `colors { }` reaches the running theme — and one *removed*
+    /// from the file reverts to the stock palette, which is why
+    /// `reload_config` rebuilds from `Theme::saola()` rather than mutating
+    /// the current palette (apply only writes `Some` fields).
+    #[test]
+    fn a_reload_applies_and_reverts_color_overrides() {
+        let mut panel = test_panel();
+        let stock_accent = Theme::saola().palette.accent;
+        let custom = saola_theme::tokens::Color::parse_hex("#123456").unwrap();
+
+        let _ = reload(
+            &mut panel,
+            config::PanelConfig {
+                colors: config::ColorOverrides {
+                    accent: Some(custom),
+                    ..config::ColorOverrides::default()
+                },
+                ..config::PanelConfig::default()
+            },
+        );
+        assert_eq!(panel.theme.palette.accent, custom);
+
+        let _ = reload(&mut panel, config::PanelConfig::default());
+        assert_eq!(panel.theme.palette.accent, stock_accent);
+    }
+
+    /// The boot CLI flags keep beating the file on every reload, exactly as
+    /// they beat it at boot — a `--islands` session stays Islands however
+    /// often a `style "ledger"` config is re-saved.
+    #[test]
+    fn a_reload_keeps_cli_overrides_winning_over_the_file() {
+        let mut panel = Panel::new(
+            islands_config(),
+            config::CliOverrides {
+                style: Some(config::PanelStyle::Islands),
+                ..config::CliOverrides::default()
+            },
+            None,
+            Theme::saola(),
+        );
+
+        let _ = reload(&mut panel, config::PanelConfig::default());
+
+        assert_eq!(panel.config.style, config::PanelStyle::Islands);
+        // A knob the flags don't cover still follows the file.
+        assert_eq!(panel.config.edge, config::Edge::Top);
+    }
+
+    /// A style flip re-roles the boot surface in place — one surface before,
+    /// the same one surface after, now drawing the other layout.
+    #[test]
+    fn a_style_reload_re_roles_the_panel_surface_in_place() {
+        let mut panel = test_panel();
+        let id = window::Id::unique();
+        let _ = panel.update(Message::SurfaceOpened(id));
+        assert_eq!(panel.windows.get(&id), Some(&SurfaceRole::Bar));
+
+        let _ = reload(&mut panel, islands_config());
+
+        assert_eq!(panel.windows.len(), 1);
+        assert_eq!(panel.windows.get(&id), Some(&SurfaceRole::Islands));
+        // The unknown-Id fallback follows too — a second output's surface
+        // opening after the reload must come up as the strip.
+        assert_eq!(panel.role(window::Id::unique()), SurfaceRole::Islands);
+    }
+
+    /// A reload that moves the panel dismisses an open popover (its surface
+    /// geometry was derived from the old config at spawn time and cannot be
+    /// migrated), while the panel surface itself stays registered.
+    #[test]
+    fn a_geometry_reload_closes_an_open_popover() {
+        let mut panel = test_panel();
+        let bar = window::Id::unique();
+        let _ = panel.update(Message::SurfaceOpened(bar));
+        let _ = panel.update(Message::Popover(popover::Message::Triggered(
+            PopoverKind::QuickSettings,
+        )));
+        assert_eq!(panel.windows.len(), 2);
+
+        let _ = reload(
+            &mut panel,
+            config::PanelConfig {
+                height: Some(64.0),
+                ..config::PanelConfig::default()
+            },
+        );
+
+        assert_eq!(
+            panel.windows.keys().collect::<Vec<_>>(),
+            vec![&bar],
+            "the popover surface must be gone, the bar's must remain"
+        );
+        assert!(!panel.popovers.is_open(PopoverKind::QuickSettings));
+    }
+
+    /// When the popover a geometry reload dismisses is the tray menu, its
+    /// content state goes with it — leaving `tray_menu` populated would
+    /// keep the Id-keyed dbusmenu watcher alive for a surface that no
+    /// longer exists, and let a straggler `Loaded` reply fold menu data
+    /// into dead state.
+    #[test]
+    fn a_geometry_reload_clears_the_dismissed_tray_menus_state() {
+        let mut panel = test_panel();
+        let _ = panel.update(Message::Tray(modules::tray::Message::ContextMenu(
+            "item-a".to_string(),
+        )));
+        assert_eq!(panel.tray_menu.item_id(), Some("item-a"));
+
+        let _ = reload(
+            &mut panel,
+            config::PanelConfig {
+                height: Some(64.0),
+                ..config::PanelConfig::default()
+            },
+        );
+
+        assert!(panel.windows.is_empty(), "the tray-menu surface is gone");
+        assert_eq!(
+            panel.tray_menu.item_id(),
+            None,
+            "its content state (and thereby its keyed watcher) must go too"
+        );
+    }
+
+    /// A content-only reload (nothing geometric changed) leaves an open
+    /// popover alone — dismissal is the price of a *moved* panel, not of
+    /// every config edit.
+    #[test]
+    fn a_content_only_reload_leaves_an_open_popover_alone() {
+        let mut panel = test_panel();
+        let _ = panel.update(Message::Popover(popover::Message::Triggered(
+            PopoverKind::QuickSettings,
+        )));
+
+        let _ = reload(
+            &mut panel,
+            config::PanelConfig {
+                claude_icon: config::ClaudeIcon::ClaudeCode,
+                ..config::PanelConfig::default()
+            },
+        );
+
+        assert!(panel.popovers.is_open(PopoverKind::QuickSettings));
+        assert_eq!(panel.config.claude_icon, config::ClaudeIcon::ClaudeCode);
     }
 }

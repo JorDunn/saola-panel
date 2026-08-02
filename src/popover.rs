@@ -87,6 +87,12 @@ pub enum PopoverKind {
     /// rule (below) now has two real kinds to prove it with, so `Probe` is
     /// gone.
     TrayMenu,
+    /// The Claude Code usage readout (2026-08-01): per-session token totals
+    /// summed from each session's transcript, opened by clicking the claude
+    /// group's mark-and-dots trigger. Content in
+    /// `popovers::claude_usage`; the transcript reads happen once per open
+    /// (`Panel::open_claude_usage`'s fetch task), never on a timer.
+    ClaudeUsage,
 }
 
 impl PopoverKind {
@@ -119,6 +125,7 @@ impl PopoverKind {
         match self {
             PopoverKind::QuickSettings => crate::popovers::quick_settings::height(theme),
             PopoverKind::TrayMenu => crate::popovers::tray_menu::height(theme),
+            PopoverKind::ClaudeUsage => crate::popovers::claude_usage::height(theme),
         }
     }
 }
@@ -307,6 +314,20 @@ impl PopoverManager {
                 self.open = None;
                 Action::Close(id)
             }
+            None => Action::None,
+        }
+    }
+
+    /// Close whatever is open, whatever kind it is — the same "dismiss the
+    /// incumbent, no kind check" rule as `Escaped`/`Unfocused` (see
+    /// [`Self::update`]), reachable without synthesizing one of those
+    /// events. The caller that needs this is `main.rs`'s config live-reload:
+    /// a popover's surface geometry was derived from the config in force
+    /// when it was spawned, so a reload that moves the panel dismisses the
+    /// popover rather than leaving it hanging where the panel used to be.
+    pub fn close_any(&mut self) -> Action {
+        match self.open.take() {
+            Some((id, _)) => Action::Close(id),
             None => Action::None,
         }
     }
@@ -567,7 +588,15 @@ mod tests {
             PopoverKind::TrayMenu.height(&theme),
             crate::popovers::tray_menu::height(&theme)
         );
-        for kind in [PopoverKind::QuickSettings, PopoverKind::TrayMenu] {
+        assert_eq!(
+            PopoverKind::ClaudeUsage.height(&theme),
+            crate::popovers::claude_usage::height(&theme)
+        );
+        for kind in [
+            PopoverKind::QuickSettings,
+            PopoverKind::TrayMenu,
+            PopoverKind::ClaudeUsage,
+        ] {
             assert!(kind.height(&theme) > 0.0);
         }
     }
