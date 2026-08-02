@@ -1,0 +1,25 @@
+# Systemd user unit for saola-panel. Only relevant to systemd-managed niri
+# sessions (`niri-session` starts graphical-session.target and imports
+# WAYLAND_DISPLAY / NIRI_SOCKET into the user environment). A plain
+# `spawn-at-startup "saola-panel"` in niri's config remains the simple path.
+#
+# The Arch package installs this to /usr/lib/systemd/user/, after which
+# `systemctl --user enable --now saola-panel.service` just works. For a manual
+# (cargo) install, copy it to ~/.config/systemd/user/ and point ExecStart at
+# your binary (e.g. %h/.cargo/bin/saola-panel), then `systemctl --user
+# daemon-reload`.
+
+[Unit]
+Description=Saola panel — status bar for the Saola desktop
+Documentation=https://github.com/JorDunn/saola-panel
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+ExecStart=/usr/bin/saola-panel
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target
