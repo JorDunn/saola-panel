@@ -9,6 +9,7 @@
 //! directory instead. `mod.rs` here re-exports the content modules and
 //! holds [`centered`], the one view helper they share.
 
+pub mod antigravity_usage;
 pub mod claude_usage;
 pub mod quick_settings;
 pub mod tray_menu;

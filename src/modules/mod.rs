@@ -63,6 +63,19 @@
 //! the clock"; the gating is what keeps it an animation rather than a poll,
 //! and the reasoning is written out in full at that `subscription`.
 //!
+//! `antigravity.rs` (Stage 25) is a **deliberate standalone copy** of
+//! `claude.rs` for Google's Antigravity CLI (`agy`), not an abstraction over
+//! it — Jordan's call, 2026-08-14, on CLAUDE.md's "copy the established module
+//! pattern" and "prefer explicit code over clever abstraction". Two agents
+//! isn't enough duplication to earn a shared core; a third would be the point
+//! to revisit that. The two modules watch two *different* D-Bus interfaces
+//! (`io.saola.ClaudeCode1` vs `io.saola.Antigravity1`) precisely so neither
+//! agent's sessions can land in the other's fold. The one genuinely new piece
+//! of logic is its `"seen"` status: agy has no `SessionStart` hook, so its
+//! statusline — which re-broadcasts several times a second — seeds the dot
+//! conditionally rather than overwriting whatever the hooks last set. Read
+//! that module's `fold` before touching either agent's fold.
+//!
 //! `bluetooth.rs` is the zbus bridge's **fan-in** case: BlueZ reports the
 //! state this module renders through three different signals
 //! (`InterfacesAdded`, `InterfacesRemoved`, and a `MatchRule`-filtered
@@ -82,6 +95,19 @@
 //! (`#[zbus::interface]` + `ObjectServer`) rather than only consuming one;
 //! read `tray/watcher.rs`'s doc comment before writing any other module that
 //! has to own a bus name.
+//!
+//! `notifications.rs` (Stage 28) is the zbus bridge's **owner-watching** case,
+//! and the first module whose service is expected to come and go *within* a
+//! session: `saola-notifications` is a user service Jordan restarts, and the
+//! panel routinely starts before it. Every other proxied module here makes one
+//! connection attempt and renders nothing forever if it fails; this one keys
+//! its worker on `org.freedesktop.DBus`' `NameOwnerChanged` for the daemon's
+//! bus name, so appearing and disappearing are signals like any other and the
+//! bell re-attaches with no panel restart. Read its doc comment before writing
+//! another module against a service that can restart. It is also the third
+//! module to own an `update` returning a `Task` — its two clicks are remote
+//! calls (`ToggleCentre`, `SetDnd`), and it deliberately changes no local
+//! state when it fires them.
 //!
 //! `power.rs` (Stage 17) is the first **popover-only** module: it has the
 //! standard surface *minus* `view` — a state struct, a `Message`, a
@@ -104,6 +130,7 @@
 //! read its doc comment's table before assuming any other module's single
 //! source of truth generalises.
 
+pub mod antigravity;
 pub mod battery;
 pub mod bluetooth;
 pub mod brightness;
@@ -114,6 +141,7 @@ pub mod mark;
 pub mod media;
 pub mod network;
 pub mod niri;
+pub mod notifications;
 pub mod power;
 pub mod tray;
 pub mod volume;

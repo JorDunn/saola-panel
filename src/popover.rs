@@ -93,6 +93,19 @@ pub enum PopoverKind {
     /// `popovers::claude_usage`; the transcript reads happen once per open
     /// (`Panel::open_claude_usage`'s fetch task), never on a timer.
     ClaudeUsage,
+    /// The Antigravity usage readout (Stage 26): per-session status rows —
+    /// each with its token counters and a context-window fill gauge the
+    /// Claude Code popover has no equivalent of (stage 26b) — plus the
+    /// account's two weekly quota gauges, opened by clicking the antigravity
+    /// group's mark-and-dots trigger. Content in
+    /// `popovers::antigravity_usage`, and still **no fetch task**: unlike
+    /// `ClaudeUsage`, whose numbers come off a transcript file, agy's arrive
+    /// by `TokensChanged` signal, so this kind's content is a synchronous
+    /// read of `Antigravity`'s already-folded state and its trigger routes
+    /// through the plain [`Message::Triggered`] toggle like
+    /// `QuickSettings`/`TrayMenu` rather than getting its own
+    /// `open_antigravity_usage` opener.
+    AntigravityUsage,
 }
 
 impl PopoverKind {
@@ -126,6 +139,7 @@ impl PopoverKind {
             PopoverKind::QuickSettings => crate::popovers::quick_settings::height(theme),
             PopoverKind::TrayMenu => crate::popovers::tray_menu::height(theme),
             PopoverKind::ClaudeUsage => crate::popovers::claude_usage::height(theme),
+            PopoverKind::AntigravityUsage => crate::popovers::antigravity_usage::height(theme),
         }
     }
 }
@@ -592,10 +606,15 @@ mod tests {
             PopoverKind::ClaudeUsage.height(&theme),
             crate::popovers::claude_usage::height(&theme)
         );
+        assert_eq!(
+            PopoverKind::AntigravityUsage.height(&theme),
+            crate::popovers::antigravity_usage::height(&theme)
+        );
         for kind in [
             PopoverKind::QuickSettings,
             PopoverKind::TrayMenu,
             PopoverKind::ClaudeUsage,
+            PopoverKind::AntigravityUsage,
         ] {
             assert!(kind.height(&theme) > 0.0);
         }

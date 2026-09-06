@@ -1,0 +1,80 @@
+{
+  "//": [
+    "contrib/antigravity/hooks.json.example — agy's own hooks schema, NOT",
+    "settings.json (compare contrib/claude-code/settings.hooks.json.example,",
+    "which merges into Claude Code's settings.json under a top-level 'hooks'",
+    "key). Per <https://antigravity.google/docs/hooks>: 'Hooks are configured",
+    "in a hooks.json file in your customization directory (e.g. .agents/ in",
+    "your workspace or ~/.gemini/config/).' Copy this file's contents (minus",
+    "these '//' comment keys, which are not valid JSON and exist here only as",
+    "documentation — see the note at the bottom) to one of:",
+    "  ~/.gemini/config/hooks.json          (global, all workspaces)",
+    "  <workspace>/.agents/hooks.json       (this workspace only)",
+    "and fill in the real path to emit.sh (see below). The '//'-prefixed",
+    "keys below are valid JSON but are NOT part of agy's hooks.json schema",
+    "(they're a comment convention, not a documented field) — strip them",
+    "before installing if agy's loader turns out to validate strictly",
+    "against unknown top-level keys; 'name', 'enabled', and 'hooks' are the",
+    "only keys documented at <https://antigravity.google/docs/hooks>.",
+    "",
+    "Schema shape: a named wrapper object carrying an 'enabled' flag, then",
+    "event names mapping to arrays of { matcher, hooks: [{ type, command,",
+    "timeout }] } entries — structurally close to Claude Code's hooks shape,",
+    "but the wrapper and the flag are agy-specific.",
+    "",
+    "Only PreInvocation and Stop are wired here. PreToolUse and PostToolUse",
+    "are deliberately NOT wired — see the 'why not PreToolUse/PostToolUse'",
+    "note at the bottom before adding them.",
+    "",
+    "Stop -> emit.sh done: a Stop whose stdin payload carries a non-empty",
+    "`.error` field is upgraded from `done` to `attention` INSIDE emit.sh",
+    "(it reads `.error` off the same stdin payload it already parses for",
+    "`conversationId`/`transcriptPath`), not by wiring a second Stop hook",
+    "entry here — a hook's stdin can only be consumed once, so two Stop",
+    "commands racing to read it would mean only one ever sees the payload.",
+    "See emit.sh's header comment for the full reasoning."
+  ],
+  "name": "saola-panel-antigravity",
+  "enabled": true,
+  "hooks": {
+    "PreInvocation": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/saola-panel/contrib/antigravity/emit.sh working",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/Developer/saola-panel/contrib/antigravity/emit.sh done",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "//why-not-pretooluse-posttooluse": [
+    "PreToolUse's response schema REQUIRES a `decision` field",
+    "(allow/deny/ask/force_ask/deny_unless_prior_grant) — it is the one agy",
+    "event where a hook's stdout participates directly in the tool-",
+    "permission path. A status emitter has no basis to decide whether a",
+    "tool call should be allowed, and printing the wrong `decision` (or none,",
+    "if a future agy version stops defaulting a missing key to `allow`)",
+    "could block or silently alter Jordan's own tool calls. PostToolUse's",
+    "contract is just `{}` and would be technically safe to wire, but there",
+    "is no status this phase's vocabulary needs it for (Stop already covers",
+    "'turn ended') and adding it would only be one more hook invocation per",
+    "tool call for no new information. Both are left out on purpose, not by",
+    "oversight — do not add PreToolUse without re-reading",
+    "<https://antigravity.google/docs/hooks>'s decision contract first."
+  ]
+}

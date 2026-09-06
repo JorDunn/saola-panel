@@ -32,21 +32,23 @@ left / center (clock) / right (status pills) — keep this outer layout swappabl
 Islands style (floating pill clusters) can be added later as a mode.
 
 D-Bus modules (battery = UPower, Wi-Fi = iwd, media = MPRIS, tray = SNI, Claude Code =
-`io.saola.ClaudeCode1` signals) use async zbus proxies/streams feeding iced
-subscriptions via stream channels — never blocking calls on the UI thread. Non-D-Bus
-signal sources have their own bridges: libpulse (volume) runs on a dedicated thread
-pushing snapshots through an unbounded channel ("thread bridge", handoff 10); niri IPC
-reads JSON lines from `$NIRI_SOCKET` through the shared bridge in `modules/niri.rs`,
-which feeds both the columns minimap and the window-title module with independent
-dedupes. **Every module maps to a signal, never a poll** — nothing in the panel ticks
-faster than the clock. Two sanctioned exceptions, both gated subscriptions rather than
-standing timers: the Claude Code module's session status dots breathe while a
-`working`/`subagent` dot is on screen (decided 2026-07-31 alongside the session-status
-semaphore itself), and the window-title module's opt-in marquee (style guide §5,
-2026-08-01) ticks only while marquee mode is configured *and* an overflowing title is
-actually showing — a stock config never runs it. A module whose service is
-absent (no battery, no iwd, no pulse, no `$NIRI_SOCKET`) renders nothing and must not
-take the panel down.
+`io.saola.ClaudeCode1` signals, Antigravity = `io.saola.Antigravity1` signals,
+notifications = `io.saola.Notifications1` properties) use async zbus proxies/streams
+feeding iced subscriptions via stream channels — never blocking calls on the UI thread.
+Non-D-Bus signal sources have their own bridges: libpulse (volume) runs on a dedicated
+thread pushing snapshots through an unbounded channel
+("thread bridge", handoff 10); niri IPC reads JSON lines from `$NIRI_SOCKET` through the
+shared bridge in `modules/niri.rs`, which feeds both the columns minimap and the
+window-title module with independent dedupes. **Every module maps to a signal, never a
+poll** — nothing in the panel ticks faster than the clock. Two sanctioned exceptions,
+both gated subscriptions rather than standing timers: the session-status semaphore's
+dots breathe while a `working`/`subagent` dot is on screen (decided 2026-07-31 for the
+Claude Code module and inherited unchanged by the Antigravity module on 2026-08-14 — one
+exception, now fed by two modules' subscriptions, not two exceptions), and the
+window-title module's opt-in marquee (style guide §5, 2026-08-01) ticks only while
+marquee mode is configured *and* an overflowing title is actually showing — a stock
+config never runs it. A module whose service is absent (no battery, no iwd, no pulse, no
+`$NIRI_SOCKET`) renders nothing and must not take the panel down.
 Jordan runs **iwd, not NetworkManager** — never write NetworkManager code.
 
 Phase 2 (stages 7–22 in PLAN.md) grows this into the full-spec panel: per-module
@@ -54,8 +56,8 @@ message enums nested in the panel enum, SVG icon infra (Lucide, stroke 2.75), ma
 MPRIS + volume + niri-columns + Claude Code + tray (full dbusmenu) modules,
 multi-window daemon architecture (`SurfaceRole` registry), KDL config
 (`~/.config/saola/panel.kdl`), Islands layout (three solid-ink islands; the
-notifications island is a flagged future slot), and popover infrastructure (one open
-at a time) with quick settings.
+notifications bell rides in the right island as its own standalone group, not a fourth
+island), and popover infrastructure (one open at a time) with quick settings.
 
 ## Design language (binding — the theme crate is the authority)
 
@@ -68,10 +70,12 @@ at a time) with quick settings.
 - **Three colors, never a fourth**; the one rule: ivory fill = at rest, terracotta fill =
   on/selected/live. A module's "active" state (charging, connected-and-transferring…) is
   terracotta per this rule — never a new color, no green/red status colors. The one
-  scoped exception (decided 2026-07-31): the five session-status semaphore colors from
-  saola-theme (style guide §"Session status semaphore"), used *only* by the Claude Code
-  module's per-session status dots — never by any control or fill. The rule stands
-  everywhere else.
+  scoped exception (decided 2026-07-31, worded to cover a second agent on 2026-08-14):
+  the five session-status semaphore colors from saola-theme (style guide §"Session status
+  semaphore"), used *only* by the Claude Code and Antigravity modules' per-session status
+  dots — never by any control or fill. Widening the exception to a second agent did not
+  reopen it: it is still exactly one readout type, five hues, now fed by two modules
+  instead of one. The rule stands everywhere else.
 - On the bar, that rule applies at the *element* scale, not the pill scale (concept 4b,
   PLAN.md Stage 14.5): status modules are bare ivory icon + text directly on ink;
   terracotta marks live states as a small accent (glyph, dot, `accent_light` text),
@@ -102,8 +106,8 @@ at a time) with quick settings.
   panel's outer enum (`Message::Battery(battery::Message)`).
 - Jordan is newer to Rust: comment the non-obvious (async ownership, proxy macros,
   stream bridging) as teaching notes; prefer explicit code over clever abstraction.
-- Out of scope (don't build speculatively): **everything notifications** (daemon,
-  popups, centre, bar indicator — a future saola-notifications component owns it) and
+- Out of scope (don't build speculatively): **notification popups and the centre**
+  (saola-notifications owns them; the bar indicator is `modules::notifications`) and
   **network management UI** (iwd status display only; the QS Wi-Fi toggle is opt-in
   per stage 17).
 

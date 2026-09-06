@@ -11,8 +11,8 @@ wallpaper). Both read the same `panel.kdl` module lists and compose the same per
 views — see [Configuring it](#configuring-it).
 
 <!-- screenshot: ledger style — one ink pill top edge, mark+media left,
-     clock+niri-column-dashes centered, volume/network/battery/claude/tray right,
-     wallpaper visible only outside the pill's rounded ends -->
+     clock+niri-column-dashes centered, volume/network/battery/claude/antigravity/tray
+     right, wallpaper visible only outside the pill's rounded ends -->
 
 <!-- screenshot: islands style — three separate translucent pill clusters over
      wallpaper, same module content as ledger, no connecting bar between them -->
@@ -129,7 +129,9 @@ the question this should let you answer at a glance.
 | Network (Wi-Fi) | iwd, system D-Bus (`net.connman.iwd`) | Jordan runs iwd, not NetworkManager — this panel never speaks NetworkManager, overriding the style guide's own NetworkManager mention. |
 | Battery | UPower, system D-Bus (`org.freedesktop.UPower`) | Hidden on a machine with no battery. |
 | Claude Code | custom broadcast signal, session D-Bus (`io.saola.ClaudeCode1`) | No service to poll — a hook script fires one signal and exits. See [Claude Code integration](#claude-code-integration) below. |
+| Antigravity (`agy`) | custom broadcast signal, session D-Bus (`io.saola.Antigravity1`) | Same shape as Claude Code, fed by both hooks and agy's own statusline. See [Antigravity integration](#antigravity-integration) below. |
 | Tray (SNI) | StatusNotifierItem/Watcher, session D-Bus (`org.kde.StatusNotifierWatcher`) | The panel **serves** the watcher if nothing else on the session does, rather than only consuming one — the first module to own a bus name. |
+| Notifications | `io.saola.Notifications1` properties, session D-Bus | Bell glyph plus count; the notification centre and popups are `saola-notifications`' own surfaces, not this panel's. See [Notifications integration](#notifications-integration) below and [`contrib/notifications/README.md`](contrib/notifications/README.md). |
 
 Popover content (quick settings, tray context menus) is not a bar module — it reads the
 bar modules' own state (`Volume`, `Media`, the tray registry) directly; see
@@ -137,8 +139,9 @@ bar modules' own state (`Volume`, `Media`, the tray registry) directly; see
 
 ## Claude Code integration
 
-The Claude Code pill (rightmost bar element) tracks Claude Code sessions via a small
-broadcast-signal protocol, not by watching Claude Code's own process or files:
+The Claude Code pill (right region, immediately left of the Antigravity pill) tracks
+Claude Code sessions via a small broadcast-signal protocol, not by watching Claude
+Code's own process or files:
 
 - **Bus**: session bus · **path** `/io/saola/ClaudeCode` · **interface**
   `io.saola.ClaudeCode1` · **signal** `StatusChanged(session_id: s, status: s)`, where
@@ -187,6 +190,49 @@ merging, run a real Claude Code session in any other project and watch the pill:
 should show nothing while idle-only, `working` during generation, and `input?` on a
 permission prompt.
 
+## Antigravity integration
+
+The Antigravity pill (immediately right of the Claude Code one) tracks `agy` — Google's
+Antigravity CLI — sessions over the same broadcast-signal pattern, on its own interface
+(`io.saola.Antigravity1`) so the two agents' sessions can never collide in one fold. It
+is a full copy of the Claude Code module, not a shared core — [`contrib/antigravity/`](contrib/antigravity)
+and its own [README](contrib/antigravity/README.md) are the source of truth for the wire
+schema and every install detail; this section only points at the two manual steps.
+
+**Manual setup, Jordan's, not automated by this repo:**
+
+1. Copy [`contrib/antigravity/hooks.json.example`](contrib/antigravity/hooks.json.example)
+   to `~/.gemini/config/hooks.json` (or a workspace's `.agents/hooks.json`) — **not**
+   `~/.gemini/antigravity-cli/settings.json`. agy hooks live in their own file, unlike
+   Claude Code's, which share `settings.json` with everything else.
+2. Chain [`contrib/antigravity/statusline.sh`](contrib/antigravity/statusline.sh) ahead
+   of Jordan's existing oh-my-posh statusline in the `statusLine` key of
+   `~/.gemini/antigravity-cli/settings.json` — see
+   [`settings.json.example`](contrib/antigravity/settings.json.example) for the exact
+   merge. This is also what feeds the usage popover's quota gauges and the
+   `agent_state`-driven status updates between hook events; hooks alone still get you
+   working/done/attention dots on their own.
+
+The Antigravity usage popover additionally shows a per-session **context-window fill
+gauge and token counts** that the Claude Code popover doesn't have — agy's statusline
+hands those numbers over directly, so the panel never needs the transcript read Claude
+Code's popover does.
+
+## Notifications integration
+
+The bell sits in the right region, as the rightmost pill — directly above where the
+notification centre opens. It is a readout plus two remote calls against
+`saola-notifications`' bar-facing D-Bus interface (`io.saola.Notifications1`). It hosts
+no notification surface of its own: the daemon owns the notification centre and every
+popup. Left click sends `ToggleCentre()`; right click toggles Do Not Disturb
+(`SetDnd`). The bell renders nothing when the daemon isn't running, and re-attaches on
+its own when the daemon starts.
+
+[`contrib/notifications/README.md`](contrib/notifications/README.md) is the source of
+truth for the panel-side rendering rules and the smoke test. It points at the daemon's
+own frozen-contract file. It does not restate that file. `saola-notifications` is a
+separate repository — this repo does not build, install, or configure it.
+
 ## Design language (binding)
 
 The bar is a **shell surface: always ink** — never toggled to paper, in either layout
@@ -196,19 +242,18 @@ fill = on/selected/live — applied at the *element* scale on the bar (bare icon
 directly on ink, not a whole pill flood) with the ledger clock and media pill as the two
 deliberate pill exceptions. See [`docs/SAOLA-STYLE-GUIDE.md`](docs/SAOLA-STYLE-GUIDE.md)
 for the full spec and CLAUDE.md for this repo's binding overrides of it (iwd instead of
-NetworkManager; no notifications; no network-management UI).
+NetworkManager; no notification popups or centre; no network-management UI).
 
 ## Known quirks and deliberate gaps
 
 Carried forward from the Phase 2 stage handoffs — read as "known, not forgotten," not
 bugs:
 
-- **Three islands, not four.** The style guide's Islands layout has a fourth surface
-  (mark+media, clock+strip, status, *notifications*); this build ships the first three.
-  Everything notifications — daemon, popups, a bar indicator — is out of scope for this
-  phase by explicit decision; a future `saola-notifications` component owns it. Adding
-  the fourth is one more `IslandKind` variant plus one arm in each of the three matches
-  that consume it, all compiler-enforced.
+- **Three islands, not four — by decision, not by gap.** The style guide's Islands
+  layout sketch shows a fourth surface for notifications. This panel instead folds the
+  notification bell into the existing right island, as its own standalone group. The
+  tray gets its own pill the same way. The panel adds no fourth `IslandKind`. See
+  [Notifications integration](#notifications-integration) above.
 - **Popover horizontal placement is a flat approximation.** Every popover (quick
   settings, every tray menu regardless of which tray icon triggered it) anchors at the
   same fixed margin from the panel's edge, not under the icon that opened it — iced 0.14
@@ -227,13 +272,23 @@ bugs:
   import) whenever a second consumer exists; not done speculatively here.
 - **Quick settings' 2×2 grid (Wi-Fi, Bluetooth, Do Not Disturb, Airplane Mode) is
   entirely placeholder** — styled, disabled, no backend. Bluetooth has no module in this
-  phase's plan; Do Not Disturb belongs to the excluded notifications component; a Wi-Fi
-  power toggle was explicitly declined (iwd status display only, per CLAUDE.md).
+  phase's plan. Do Not Disturb already has a working control elsewhere: a right click on
+  the notification bell (see [Notifications integration](#notifications-integration)
+  above). So this grid entry stays a disabled placeholder, and does not add a second,
+  competing control. A Wi-Fi power toggle was explicitly declined (iwd status display
+  only, per CLAUDE.md).
 - **Stale Claude Code sessions never expire.** A session that dies without emitting
   `ended` (a killed terminal, a sleep) leaves its last status in the map forever — no TTL
   sweep exists, because a sweep needs a timer ticking regardless of whether anything
   changed, which is exactly the poll CLAUDE.md forbids on every other path. Self-heals on
   a panel restart.
+- **Antigravity has no session-end event at all, so this is the normal case, not an edge
+  case.** agy's five hook events don't include anything equivalent to `SessionEnd` — no
+  agy configuration can emit `ended` today — so Antigravity dots routinely linger until
+  the panel restarts, more visibly than the Claude Code quirk above. Accepted, not fixed
+  (Jordan, 2026-08-14): the fix is the same TTL sweep, and it needs the same forbidden
+  timer. See `contrib/antigravity/README.md`'s "Known limitation" section and
+  `src/modules/antigravity.rs`'s module doc comment.
 - **The tray's `NeedsAttention` state** renders as a 2px terracotta ring around the icon
   — precedent-following (the same idiom `card_urgent` uses) but genuinely unreviewed
   against any design mockup. Trivial to change if it doesn't read right live.

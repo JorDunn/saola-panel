@@ -103,6 +103,26 @@ pub enum Icon {
     /// asset, same treatment as [`Anthropic`][Icon::Anthropic] above:
     /// solid-filled, no baked-in brand color, theme-tinted at view time.
     ClaudeCode,
+    /// The Antigravity module's bar glyph: the Antigravity CLI's own brand
+    /// mark (the arch-and-plume rune Jordan supplied, 2026-08-14). The third
+    /// deliberate brand asset in an otherwise all-Lucide set, and for the
+    /// same reason as [`Anthropic`][Icon::Anthropic]: the module reports on
+    /// one specific product, so it wears that product's mark. Unlike the
+    /// Claude Code pair there is no config knob choosing between glyphs —
+    /// Antigravity ships one mark, so `crate::config` has no
+    /// `antigravity-icon` counterpart to `claude-icon` and
+    /// `modules::antigravity` names this variant directly. Solid-filled
+    /// (`fill-rule="evenodd"`, no stroke), no baked-in brand color,
+    /// theme-tinted at view time like every other icon.
+    Antigravity,
+    /// The notification indicator's resting glyph (Lucide `bell`), and its
+    /// do-not-disturb counterpart (Lucide `bell-off`). The pair is a ladder
+    /// of exactly two rungs: `Bell` while notifications are being delivered,
+    /// `BellOff` while `io.saola.Notifications1`'s `DndActive` is true — see
+    /// `modules::notifications` for why DND is a *quiet* state (secondary
+    /// role) rather than a colored one.
+    Bell,
+    BellOff,
     /// The default Saola mark: two splaying strokes ("horns"), style guide §8.
     MarkHorns,
     /// The alternative mark: a broken ring with a dot at the break, style
@@ -146,6 +166,9 @@ impl Icon {
             Icon::BluetoothOff => include_bytes!("../assets/icons/bluetooth-off.svg"),
             Icon::Anthropic => include_bytes!("../assets/icons/anthropic.svg"),
             Icon::ClaudeCode => include_bytes!("../assets/icons/claude-code.svg"),
+            Icon::Antigravity => include_bytes!("../assets/icons/antigravity.svg"),
+            Icon::Bell => include_bytes!("../assets/icons/bell.svg"),
+            Icon::BellOff => include_bytes!("../assets/icons/bell-off.svg"),
             Icon::MarkHorns => include_bytes!("../assets/icons/mark-horns.svg"),
             Icon::MarkNotch => include_bytes!("../assets/icons/mark-notch.svg"),
         }
@@ -189,7 +212,7 @@ mod tests {
 
     /// Every embedded icon, so the tests below can walk the whole asset set
     /// without a second hand-maintained list of bytes.
-    const ALL: [Icon; 28] = [
+    const ALL: [Icon; 31] = [
         Icon::Volume2,
         Icon::Volume1,
         Icon::Volume,
@@ -216,6 +239,9 @@ mod tests {
         Icon::BluetoothOff,
         Icon::Anthropic,
         Icon::ClaudeCode,
+        Icon::Antigravity,
+        Icon::Bell,
+        Icon::BellOff,
         Icon::MarkHorns,
         Icon::MarkNotch,
     ];
@@ -233,8 +259,14 @@ mod tests {
     /// unmodified. See `modules::media`'s module doc comment and the Stage
     /// 9 handoff for the full fill-style decision. `Anthropic` and
     /// `ClaudeCode` (the brand-mark exemptions, 2026-08-01) are solid by
-    /// nature — see their variant doc comments.
-    const STROKE_ONLY: [Icon; 25] = [
+    /// nature — see their variant doc comments — and `Antigravity`
+    /// (2026-08-14, Phase 3) joins them on exactly the same grounds: it is a
+    /// supplied brand mark, a single `fill-rule="evenodd"` path with no
+    /// stroke to bake a width into, so holding it to the 2.75 invariant
+    /// would mean redrawing somebody else's logo. The exemption is for
+    /// *brand marks and solid glyphs only*; a Lucide icon that turns up here
+    /// is a mistake, not a fourth exemption.
+    const STROKE_ONLY: [Icon; 27] = [
         Icon::Volume2,
         Icon::Volume1,
         Icon::Volume,
@@ -258,6 +290,8 @@ mod tests {
         Icon::Bluetooth,
         Icon::BluetoothConnected,
         Icon::BluetoothOff,
+        Icon::Bell,
+        Icon::BellOff,
         Icon::MarkHorns,
         Icon::MarkNotch,
     ];
@@ -265,7 +299,12 @@ mod tests {
     /// The solid-filled assets — the ones exempted from the stroke-width
     /// invariant, each for its own reason spelled out in `STROKE_ONLY`'s
     /// doc comment.
-    const SOLID: [Icon; 3] = [Icon::Play, Icon::Anthropic, Icon::ClaudeCode];
+    const SOLID: [Icon; 4] = [
+        Icon::Play,
+        Icon::Anthropic,
+        Icon::ClaudeCode,
+        Icon::Antigravity,
+    ];
 
     /// Binding constraint (CLAUDE.md, PLAN.md Stage 8): every embedded
     /// *stroke-based* asset must have `stroke-width="2.75"` baked in at

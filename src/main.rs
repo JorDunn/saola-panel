@@ -128,13 +128,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use iced::alignment::Horizontal;
-use iced::widget::{button, container, row, stack, Space};
+use iced::widget::{button, container, mouse_area, row, stack, Space};
 use iced::window;
 use iced::{Element, Fill, Subscription, Task};
 use iced_layershell::build_pattern::daemon;
 use iced_layershell::reexport::{Anchor, KeyboardInteractivity, Layer};
 use iced_layershell::settings::{LayerShellSettings, Settings, StartMode};
 use iced_layershell::to_layer_message;
+use modules::antigravity::Antigravity;
 use modules::battery::Battery;
 use modules::claude::ClaudeCode;
 use modules::clock::Clock;
@@ -142,6 +143,7 @@ use modules::columns::Columns;
 use modules::mark::Mark;
 use modules::media::Media;
 use modules::network::Network;
+use modules::notifications::Notifications;
 use modules::tray::Tray;
 use modules::volume::Volume;
 use modules::window_title::WindowTitle;
@@ -806,11 +808,21 @@ enum Message {
     /// fires and forgets (see `modules::claude`'s doc comment for the
     /// signal-listener bridge shape, and for why the animation timer is a
     /// sanctioned exception to "nothing ticks faster than the clock").
-    /// Also the only variant `Panel::update` delegates wholesale to the
-    /// module rather than destructuring itself. Last of the right region,
-    /// per the style guide's module order (`right { volume; network;
-    /// battery; claude; tray; ... }`).
+    /// Also one of the two variants `Panel::update` delegates wholesale to
+    /// the module rather than destructuring itself (the other is
+    /// `Antigravity` just below). Near the end of the right region, per the
+    /// style guide's module order (`right { volume; network; battery; claude;
+    /// antigravity; tray; ... }`).
     ClaudeCode(modules::claude::Message),
+    /// Wraps `modules::antigravity::Message` — the same three-variant shape as
+    /// `ClaudeCode` above (`Updated`, `UsageUpdated`, `Tick`), for Google's
+    /// Antigravity CLI (`agy`) instead. Its own variant rather than a shared
+    /// "agent" one, matching the standalone-copy decision (Jordan, 2026-08-14):
+    /// two agents, two D-Bus interfaces, two folds that can never mix. Also
+    /// delegated wholesale to the module. Sits between `ClaudeCode` and `Tray`
+    /// in the right region, and renders as its own standalone group beside
+    /// Claude Code's (see `Panel::right_region_split`).
+    Antigravity(modules::antigravity::Message),
     /// Wraps `modules::tray::Message` (currently just `Updated(Tray)`), the
     /// current set of registered StatusNotifierItems. The first module whose
     /// worker **serves** a D-Bus interface rather than only consuming one:
@@ -819,6 +831,20 @@ enum Message {
     /// registry (see `modules::tray`'s doc comment). Sits after `claude` in
     /// the right region, per the style guide's module order.
     Tray(modules::tray::Message),
+    /// Wraps `modules::notifications::Message` — a fresh reading of
+    /// `io.saola.Notifications1`'s four properties, the daemon going away, or
+    /// one of the bell's two clicks. The **third** variant `Panel::update`
+    /// delegates wholesale (the two agent modules are the others), and the
+    /// first whose module answers with a `Task`: its clicks are remote calls
+    /// on the daemon's proxy, not local state changes.
+    ///
+    /// Phase 4's one lifted exclusion (2026-09-05). The bar hosts no
+    /// notification surface — popups and the centre stay
+    /// `saola-notifications`' own layer-shell windows, which is why this
+    /// carries no `PopoverKind` and no popover content module. Renders at the
+    /// trailing end of the right region, per the style guide's `panel { }`
+    /// sketch (`right { … tray; notifications }`).
+    Notifications(modules::notifications::Message),
     /// Wraps [`popover::Message`] — the panel's first *interaction* messages
     /// rather than snapshots from a signal source. Three producers: the
     /// status cluster's trigger button (a click on it, in either layout),
@@ -932,21 +958,26 @@ enum SurfaceRole {
 /// # The three-vs-four deviation (deliberate, flagged)
 ///
 /// Spec §7 inventories the Islands panel as **four** clusters: mark +
-/// window title, clock + column strip, status, and *notifications*. This phase
-/// ships **three**. Everything notifications is out of scope for Phase 2
-/// by an explicit decision recorded in PLAN.md; a future
-/// `saola-notifications` component owns it. Nothing here forecloses the
-/// fourth: it arrives as one more variant on this enum plus one more
-/// layer in `Panel::islands_view` and an arm in `Panel::island_view`,
-/// which the compiler will demand.
+/// window title, clock + column strip, status, and *notifications*. This
+/// build still ships **three**, and that is now a layout decision rather than
+/// a scope one: Phase 4 (2026-09-05) added the notifications *indicator*, and
+/// it rides in [`IslandKind::Right`] as its own pill — pulled out of the
+/// status cluster by `Panel::right_region_split` exactly as the tray and the
+/// two agent modules are, which is all the separation one glyph earns. A
+/// dedicated fourth island would need a `panel.kdl` list of its own to say
+/// what goes in it (see the naming note below), and one bell does not justify
+/// that plumbing. Nothing here forecloses it: it would arrive as one more
+/// variant on this enum plus one more layer in `Panel::islands_view` and an
+/// arm in `Panel::island_view`, which the compiler will demand.
 ///
 /// The variants are named for **position, not payload**, because that is what
 /// the config actually configures: each one maps 1:1 onto one of
 /// `panel.kdl`'s `left` / `center` / `right` module lists (Stage 14), so the
 /// island grouping is whatever the user's config says and there is no second
-/// copy of the module lists anywhere in this file. A notifications island
-/// would come with its own list — which is the one piece of config plumbing
-/// the fourth slot would need.
+/// copy of the module lists anywhere in this file. A dedicated notifications
+/// island would come with its own list — which is the one piece of config
+/// plumbing the fourth slot would need, and the reason Phase 4's bell rides
+/// in the right island instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IslandKind {
     /// `config.left` — the mark and the focused window title, hugging the
@@ -1071,15 +1102,32 @@ struct Panel {
     /// animation); starts as `ClaudeCode::default()` (no `StatusChanged`
     /// signal seen yet → renders nothing — the same "quiet until proven
     /// otherwise" contract as every module above, just for a hook that
-    /// hasn't fired instead of a service that isn't there). Last of the
-    /// right region.
+    /// hasn't fired instead of a service that isn't there). Near the end of
+    /// the right region.
     claude_code: ClaudeCode,
+    /// The same thing again for Antigravity (`agy`) sessions, fed by its own
+    /// `io.saola.Antigravity1` worker; starts as `Antigravity::default()`
+    /// (nothing heard from → renders nothing). Deliberately a second field
+    /// rather than a generalized "agents" collection — see
+    /// `modules::antigravity`'s doc comment for the standalone-copy decision.
+    /// Note it takes no constructor argument, unlike `claude_code` above:
+    /// Antigravity has one brand mark, so there is no icon knob to hand it
+    /// (`config::ModuleName::Antigravity` explains the asymmetry).
+    antigravity: Antigravity,
     /// The registered StatusNotifierItems the tray worker last reported;
     /// starts as `Tray::default()` (nothing registered → renders nothing).
     /// Unlike every module above it, the worker behind this one may be
     /// *serving* the session's `org.kde.StatusNotifierWatcher` rather than
     /// reading somebody else's service — see `modules::tray`.
     tray: Tray,
+    /// The notification daemon's last reported count and flags; starts as
+    /// `Notifications::default()` (`present: false` — no daemon on the bus
+    /// yet, so nothing is drawn). Unlike every other proxied module's field,
+    /// this one can go back to absent and return again *within* a session:
+    /// `saola-notifications` is a user service Jordan restarts, and the
+    /// module's worker watches the bus name rather than making one connection
+    /// attempt (see `modules::notifications`).
+    notifications: Notifications,
     /// Every layer-shell surface this process currently owns, keyed by the
     /// `window::Id` the runtime identifies it with, valued by what the
     /// surface is for. Starts **empty**, not pre-seeded with the bar: the
@@ -1158,7 +1206,9 @@ impl Panel {
             power: modules::power::Power::default(),
             brightness: modules::brightness::Brightness::default(),
             claude_code: ClaudeCode::new(config.claude_icon),
+            antigravity: Antigravity::default(),
             tray: Tray::default(),
+            notifications: Notifications::default(),
             windows: HashMap::new(),
             popovers: PopoverManager::default(),
             volume_commands: None,
@@ -1407,10 +1457,10 @@ impl Panel {
                     Task::none()
                 }
             }
-            // The one module that *delegates* rather than storing a
-            // snapshot: `claude::Message` carries both a new session list
+            // The two modules that *delegate* rather than storing a
+            // snapshot: their `Message` carries both a new session list
             // and the frames of the dot row's breathing animation, and
-            // folding a tick into an animation epoch is this module's own
+            // folding a tick into an animation epoch is each module's own
             // business, not the panel's. So the outer variant is unwrapped
             // and the inner value handed straight to the module (see
             // `modules::claude::ClaudeCode::update`) — the per-module
@@ -1420,6 +1470,25 @@ impl Panel {
                 self.claude_code.update(message);
                 Task::none()
             }
+            // Antigravity's half of that pair — a standalone module, so a
+            // standalone arm; nothing about `agy` routes through the Claude
+            // Code state (see `modules::antigravity`'s doc comment).
+            Message::Antigravity(message) => {
+                self.antigravity.update(message);
+                Task::none()
+            }
+            // The third delegating arm, and the only one whose module hands
+            // back work to do: `Notifications::update` folds a snapshot (or
+            // an absence) *and* answers the bell's two clicks with a one-shot
+            // D-Bus call, so the returned `Task` is lifted into the panel's
+            // message type the same way every module's subscription and view
+            // already are. The panel deliberately learns nothing about which
+            // inner variant it was — the "is this a readout or a command?"
+            // question belongs to the module (see `modules::notifications`).
+            Message::Notifications(message) => self
+                .notifications
+                .update(message)
+                .map(Message::Notifications),
             Message::Tray(modules::tray::Message::Updated(tray)) => {
                 self.tray = tray;
                 Task::none()
@@ -2071,7 +2140,21 @@ impl Panel {
             // would spawn a fresh thread each time.
             self.brightness.subscription().map(Message::Brightness),
             self.claude_code.subscription().map(Message::ClaudeCode),
+            // A second signal-listener worker on the same session bus,
+            // watching `io.saola.Antigravity1` instead. `Subscription::run`
+            // keys on the *function pointer*, so these two are distinct
+            // subscriptions and both stay alive — near-identical bodies do not
+            // collapse into one.
+            self.antigravity.subscription().map(Message::Antigravity),
             self.tray.subscription().map(Message::Tray),
+            // Unconditional, and load-bearingly so: this worker's job while
+            // the module is *absent* is waiting for the daemon's bus name to
+            // gain an owner, so a subscription gated on presence could never
+            // notice the daemon starting. Nothing in it ticks — the wait is
+            // parked on `NameOwnerChanged`.
+            self.notifications
+                .subscription()
+                .map(Message::Notifications),
             // `panel.kdl` live-reload. Not a module signal either — it feeds
             // the whole panel, not one field — but a signal all the same:
             // inotify pushes file-change events, so an untouched config
@@ -2159,6 +2242,13 @@ impl Panel {
                     self.claude_code.usage(),
                 )
             }
+            // No popover-local state at all, unlike `ClaudeUsage` above —
+            // `popovers::antigravity_usage::view` reads `self.antigravity`
+            // directly (see that module's doc comment for why there is no
+            // fetch to stage behind a `Panel` field).
+            PopoverKind::AntigravityUsage => {
+                popovers::antigravity_usage::view(&self.theme, &self.antigravity)
+            }
         }
     }
 
@@ -2227,32 +2317,46 @@ impl Panel {
 
     /// The right region, split into its standalone groups (2026-08-01,
     /// Jordan: the Claude Code dots are their own island immediately left
-    /// of the tray): everything in `config.right` *except* `claude` and
-    /// `tray` forms the status cluster (the quick-settings trigger),
-    /// while those two — wherever they appear in the list — each render
-    /// as their own group before it, in the fixed order (Jordan,
-    /// 2026-08-01, superseding the earlier status-first order):
-    /// claude, tray, status cluster. Claude gets its own trigger (the
-    /// usage popover) so a click on its dots can't mean quick settings;
-    /// tray icons are already their own buttons and need no trigger
-    /// wrapper at all.
+    /// of the tray; extended 2026-08-14 with Antigravity's own group
+    /// immediately right of Claude Code's, and 2026-09-05 with the
+    /// notifications bell at the trailing end): everything in `config.right`
+    /// *except* `claude`, `antigravity`, `tray` and `notifications` forms the
+    /// status cluster (the quick-settings trigger), while those four —
+    /// wherever they appear in the list — each render as their own group, in
+    /// the fixed order (superseding the earlier status-first order):
+    /// **claude, antigravity, tray, status cluster, notifications**. Each
+    /// agent group gets its own trigger (its usage popover) so a click on its
+    /// dots can't mean quick settings; tray icons are already their own
+    /// buttons and need no trigger wrapper at all; and the bell needs one for
+    /// the same reason the agents do — its click calls `ToggleCentre()` on
+    /// the notification daemon, which is emphatically not quick settings.
     ///
-    /// Returns `(status modules, claude listed, tray listed)` — the two
-    /// flags say "the config asked for it", and the callers still gate
-    /// each group on `module_is_present` so an absent module costs no gap
-    /// (ledger) and no pill (islands).
-    fn right_region_split(&self) -> (Vec<config::ModuleName>, bool, bool) {
+    /// The bell is the one group that sits to the *right* of the status
+    /// cluster rather than the left. That is the style guide's own
+    /// `panel { }` sketch (`right { … tray; notifications }`), and it puts
+    /// the bell directly above the screen corner where `saola-notifications`
+    /// anchors its centre — the surface the click opens.
+    ///
+    /// Returns `(status modules, claude listed, antigravity listed, tray
+    /// listed, notifications listed)` — the four flags say "the config asked
+    /// for it", and the callers still gate each group on `module_is_present`
+    /// so an absent module costs no gap (ledger) and no pill (islands).
+    fn right_region_split(&self) -> (Vec<config::ModuleName>, bool, bool, bool, bool) {
         let mut cluster = Vec::new();
         let mut claude = false;
+        let mut antigravity = false;
         let mut tray = false;
+        let mut notifications = false;
         for name in &self.config.right {
             match name {
                 config::ModuleName::Claude => claude = true,
+                config::ModuleName::Antigravity => antigravity = true,
                 config::ModuleName::Tray => tray = true,
+                config::ModuleName::Notifications => notifications = true,
                 other => cluster.push(*other),
             }
         }
-        (cluster, claude, tray)
+        (cluster, claude, antigravity, tray, notifications)
     }
 
     /// The ledger bar's claude group: the module's mark-and-dots view
@@ -2301,6 +2405,118 @@ impl Panel {
         .into()
     }
 
+    /// The ledger bar's antigravity group — a copy of [`Panel::
+    /// claude_cluster_trigger`] pointed at the `agy` module, deliberately
+    /// duplicated rather than parameterized (same standalone-copy posture as
+    /// `modules::antigravity` itself). Only built when the module is present
+    /// (the caller's gate), so an absent agy costs no gap and leaves no
+    /// invisible clickable pill.
+    fn antigravity_cluster_trigger(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        button(
+            container(self.module_view(config::ModuleName::Antigravity))
+                .height(Fill)
+                .align_y(iced::Center),
+        )
+        .height(t.sizes.panel_pill_clock)
+        .padding([0.0, t.sizes.panel_pill_clock / 2.0])
+        .style(style::button::bare(t, Surface::Ink))
+        .on_press(Message::Popover(popover::Message::Triggered(
+            PopoverKind::AntigravityUsage,
+        )))
+        .into()
+    }
+
+    /// The islands antigravity pill — a copy of [`Panel::claude_island_pill`]
+    /// for the `agy` module, with the same ink-outside/`bare`-button-inside
+    /// layering (see `island_view`'s right-arm comment for why that order is
+    /// what makes the hover tint visible).
+    fn antigravity_island_pill(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        let content = container(self.module_view(config::ModuleName::Antigravity))
+            .height(Fill)
+            .align_y(iced::Center);
+        container(
+            button(content)
+                .padding([0.0, t.sizes.panel_pill / 2.0])
+                .height(Fill)
+                .style(style::button::bare(t, Surface::Ink))
+                .on_press(Message::Popover(popover::Message::Triggered(
+                    PopoverKind::AntigravityUsage,
+                ))),
+        )
+        .style(style::container::bar_pill(t))
+        .height(Fill)
+        .into()
+    }
+
+    /// The ledger bar's notifications group: the bell readout in a
+    /// `mouse_area` carrying **both** clicks — left opens or closes
+    /// `saola-notifications`' centre, right toggles manual do-not-disturb.
+    ///
+    /// A `mouse_area`, not a `button`, and that is forced rather than
+    /// stylistic: iced's `button` has no right-press hook at all, and this
+    /// trigger needs one. `modules::tray` reached for the same widget for the
+    /// same reason (SNI items need a context-menu click), so right-press on a
+    /// layer-shell surface is already proven on this bar rather than assumed.
+    ///
+    /// The cost of dropping `button` is its hover/press styling, which is why
+    /// the *open* state is drawn inside `modules::notifications::view`
+    /// instead — it paints `style::button::bare`'s pressed fill behind the
+    /// readout while `CentreOpen` is true, so the bell reads as held down for
+    /// as long as the centre it opened is up. No `PopoverKind` is involved:
+    /// the centre is the daemon's own layer-shell surface, not a panel
+    /// popover, and the panel's one-open-at-a-time rule has no say over it.
+    ///
+    /// `.interaction(Pointer)` is the resting hover affordance — a cursor
+    /// change, exactly as each tray icon gets.
+    fn notifications_cluster_trigger(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        mouse_area(
+            container(self.module_view(config::ModuleName::Notifications))
+                .height(t.sizes.panel_pill_clock)
+                .align_y(iced::Center),
+        )
+        .interaction(iced::mouse::Interaction::Pointer)
+        .on_press(Message::Notifications(
+            modules::notifications::Message::ToggleCentre,
+        ))
+        .on_right_press(Message::Notifications(
+            modules::notifications::Message::ToggleDnd,
+        ))
+        .into()
+    }
+
+    /// The islands notifications pill — the bell's own solid-ink island,
+    /// layered like [`Panel::claude_island_pill`] (ink `bar_pill` outside,
+    /// the content inside) with the one difference this module forces: a
+    /// `mouse_area` in place of the `bare` button, because the pill has to
+    /// answer a right click (see [`Panel::notifications_cluster_trigger`]).
+    ///
+    /// Losing the button costs the hover tint the other island pills get;
+    /// the open-centre fill the module paints for itself is the affordance
+    /// that actually matters here, and it works identically in both styles.
+    fn notifications_island_pill(&self) -> Element<'_, Message> {
+        let t = &self.theme;
+        let content = container(self.module_view(config::ModuleName::Notifications))
+            .padding([0.0, t.sizes.panel_pill / 2.0])
+            .height(Fill)
+            .align_y(iced::Center);
+        container(
+            mouse_area(content)
+                .interaction(iced::mouse::Interaction::Pointer)
+                .on_press(Message::Notifications(
+                    modules::notifications::Message::ToggleCentre,
+                ))
+                .on_right_press(Message::Notifications(
+                    modules::notifications::Message::ToggleDnd,
+                )),
+        )
+        .style(style::container::bar_pill(t))
+        .height(Fill)
+        .into()
+    }
+
     /// One module's rendered element, by config name — the "name → view
     /// mapping" `config`'s module doc comment describes. Every arm mirrors
     /// what `bar_view` used to inline directly before Stage 14: the
@@ -2343,7 +2559,11 @@ impl Panel {
             config::ModuleName::Bluetooth => self.bluetooth.view(t).map(Message::Bluetooth),
             config::ModuleName::Battery => self.battery.view(t).map(Message::Battery),
             config::ModuleName::Claude => self.claude_code.view(t).map(Message::ClaudeCode),
+            config::ModuleName::Antigravity => self.antigravity.view(t).map(Message::Antigravity),
             config::ModuleName::Tray => self.tray.view(t).map(Message::Tray),
+            config::ModuleName::Notifications => {
+                self.notifications.view(t).map(Message::Notifications)
+            }
         }
     }
 
@@ -2372,7 +2592,9 @@ impl Panel {
             config::ModuleName::Bluetooth => self.bluetooth.is_present(),
             config::ModuleName::Battery => self.battery.is_present(),
             config::ModuleName::Claude => self.claude_code.is_present(),
+            config::ModuleName::Antigravity => self.antigravity.is_present(),
             config::ModuleName::Tray => self.tray.is_present(),
+            config::ModuleName::Notifications => self.notifications.is_present(),
         }
     }
 
@@ -2422,21 +2644,29 @@ impl Panel {
     fn bar_view(&self) -> Element<'_, Message> {
         let t = &self.theme;
 
-        // The right side's three groups (see `right_region_split`), in the
-        // fixed order claude, tray, status cluster — the claude and tray
-        // groups sit to the *left* of the status cluster (Jordan,
-        // 2026-08-01), which keeps the quick-settings trigger at the bar's
-        // trailing end. The first two are each gated on presence, so an
-        // absent group costs neither space nor a gap. `bar_element_gap`
-        // between groups, the same element-scale gap the left and centre
-        // regions use; the *cluster's* internal gap stays the wider
-        // `bar_cluster_gap`.
-        let (status_modules, claude_listed, tray_listed) = self.right_region_split();
+        // The right side's five groups (see `right_region_split`), in the
+        // fixed order claude, antigravity, tray, status cluster,
+        // notifications — the three agent/tray groups sit to the *left* of
+        // the status cluster (Jordan, 2026-08-01, extended 2026-08-14) and
+        // the bell to its *right* (2026-09-05, the style guide's own
+        // `panel { }` order), so the quick-settings trigger keeps the middle
+        // and the bell takes the trailing end above the centre's anchor.
+        // Every standalone group is gated on presence, so an absent one costs
+        // neither space nor a gap — a machine with no `agy` sessions and no
+        // notification daemon looks exactly like it did before either module
+        // existed. `bar_element_gap` between groups, the same element-scale
+        // gap the left and centre regions use; the *cluster's* internal gap
+        // stays the wider `bar_cluster_gap`.
+        let (status_modules, claude_listed, antigravity_listed, tray_listed, notifications_listed) =
+            self.right_region_split();
         let mut right = row![]
             .spacing(t.sizes.bar_element_gap)
             .align_y(iced::Center);
         if claude_listed && self.claude_code.is_present() {
             right = right.push(self.claude_cluster_trigger());
+        }
+        if antigravity_listed && self.antigravity.is_present() {
+            right = right.push(self.antigravity_cluster_trigger());
         }
         if tray_listed && self.tray.is_present() {
             right = right.push(
@@ -2452,6 +2682,14 @@ impl Panel {
                     .align_y(iced::Center),
             ),
         );
+        // The one group that sits *after* the status cluster (2026-09-05):
+        // the bell belongs at the bar's trailing end, directly above where
+        // the notification centre anchors. Gated on presence like the rest,
+        // so a session with no `saola-notifications` running looks exactly
+        // as it did before this module existed.
+        if notifications_listed && self.notifications.is_present() {
+            right = right.push(self.notifications_cluster_trigger());
+        }
 
         // Ledger layout (Architecture in PLAN.md): the full five-element
         // row — left region, Fill spacer, center (clock), Fill spacer,
@@ -2481,10 +2719,10 @@ impl Panel {
                     .spacing(t.sizes.bar_element_gap)
                     .align_y(iced::Center),
                 Space::new().width(Fill),
-                // The split right side built above: status cluster (the
+                // The split right side built above: the claude, antigravity
+                // and tray groups, then the status cluster (the
                 // quick-settings trigger — the whole cluster is the hit
-                // target, per spec §7's "status" unit), then the claude
-                // and tray groups.
+                // target, per spec §7's "status" unit) at the trailing end.
                 right,
             ]
             .align_y(iced::Center),
@@ -2669,12 +2907,14 @@ impl Panel {
             }
             // The right side's island *row* (2026-08-01, the same split as
             // the ledger's — see `right_region_split`): the claude pill
-            // (its own island, its own trigger — the usage popover), then
+            // (its own island, its own trigger — the usage popover), the
+            // antigravity pill beside it (2026-08-14, same shape), then
             // the tray's pill, then the shared status pill (the
-            // quick-settings trigger) at the trailing end — claude and
-            // tray sit left of the status island, same order as the
-            // ledger. `island_gap` apart like the left cluster's
-            // per-module pills.
+            // quick-settings trigger), and finally the notifications bell's
+            // own pill (2026-09-05) — same order as the ledger, three
+            // standalone islands left of the status island and one right of
+            // it. `island_gap` apart like the left cluster's per-module
+            // pills.
             //
             // The status pill keeps the ledger's `bar_cluster_gap`
             // internally — deliberately shared, because this is the one
@@ -2699,13 +2939,23 @@ impl Panel {
             // own buttons (volume, tray) inside this one is safe for the
             // reason `status_cluster_trigger`'s teaching note gives —
             // children update first, and a captured event stops here.
-            // `claude_island_pill` copies this exact layering.
+            // `claude_island_pill` and `antigravity_island_pill` copy this
+            // exact layering.
             IslandKind::Right => {
-                let (status_modules, claude_listed, tray_listed) = self.right_region_split();
+                let (
+                    status_modules,
+                    claude_listed,
+                    antigravity_listed,
+                    tray_listed,
+                    notifications_listed,
+                ) = self.right_region_split();
                 let mut pills: Vec<Element<'_, Message>> = Vec::new();
 
                 if claude_listed && self.claude_code.is_present() {
                     pills.push(self.claude_island_pill());
+                }
+                if antigravity_listed && self.antigravity.is_present() {
+                    pills.push(self.antigravity_island_pill());
                 }
                 if tray_listed && self.tray.is_present() {
                     pills.push(self.island_pill(config::ModuleName::Tray));
@@ -2735,6 +2985,12 @@ impl Panel {
                         .height(Fill)
                         .into(),
                     );
+                }
+                // After the status island, matching the ledger's order: the
+                // bell is the row's trailing pill, hugging the same screen
+                // corner the notification centre anchors to.
+                if notifications_listed && self.notifications.is_present() {
+                    pills.push(self.notifications_island_pill());
                 }
 
                 row(pills)
@@ -2991,7 +3247,9 @@ mod tests {
                 config::ModuleName::Bluetooth,
                 config::ModuleName::Battery,
                 config::ModuleName::Claude,
+                config::ModuleName::Antigravity,
                 config::ModuleName::Tray,
+                config::ModuleName::Notifications,
             ] {
                 let _: Element<'_, Message> = panel.module_view(name);
             }
@@ -3106,7 +3364,12 @@ mod tests {
             (config::ModuleName::Bluetooth, false),
             (config::ModuleName::Battery, false),
             (config::ModuleName::Claude, false),
+            (config::ModuleName::Antigravity, false),
             (config::ModuleName::Tray, false),
+            // No `saola-notifications` daemon owns its bus name in a test
+            // process, so the bell is absent like every other service-backed
+            // module.
+            (config::ModuleName::Notifications, false),
         ] {
             assert_eq!(panel.module_is_present(name), expected, "{name:?}");
         }
@@ -3727,13 +3990,72 @@ mod tests {
         let _: Element<'_, Message> = panel.view(id);
     }
 
-    /// The right region's split: `claude` and `tray` leave the status
-    /// cluster wherever the config listed them; everything else stays, in
-    /// order.
+    // ---- The Antigravity usage popover -----------------------------------
+
+    /// The antigravity group's trigger opens exactly one popover surface, in
+    /// the `AntigravityUsage` role — and a second click closes it. Unlike
+    /// `ClaudeUsage`'s equivalent test above, this trigger has no special
+    /// `Message::Popover` arm of its own (see `popover::PopoverKind::
+    /// AntigravityUsage`'s doc comment): it falls straight through to the
+    /// generic `Message::Popover(message) => self.update_popover(message)`
+    /// arm, so this test is also proof that the generic arm alone is enough
+    /// — no `open_antigravity_usage` opener was needed.
     #[test]
-    fn the_right_region_split_extracts_claude_and_tray() {
+    fn the_antigravity_trigger_toggles_a_usage_popover_surface() {
+        let mut panel = test_panel();
+        let trigger =
+            || Message::Popover(popover::Message::Triggered(PopoverKind::AntigravityUsage));
+
+        let _ = panel.update(trigger());
+        assert_eq!(panel.windows.len(), 1);
+        assert_eq!(
+            panel.windows.values().next(),
+            Some(&SurfaceRole::Popover(PopoverKind::AntigravityUsage))
+        );
+
+        let _ = panel.update(trigger());
+        assert!(panel.windows.is_empty());
+    }
+
+    /// The global one-open-at-a-time rule covers the antigravity kind too.
+    #[test]
+    fn the_antigravity_usage_popover_and_quick_settings_displace_each_other() {
+        let mut panel = test_panel();
+        let _ = panel.update(Message::Popover(popover::Message::Triggered(
+            PopoverKind::QuickSettings,
+        )));
+
+        let _ = panel.update(Message::Popover(popover::Message::Triggered(
+            PopoverKind::AntigravityUsage,
+        )));
+
+        assert_eq!(panel.windows.len(), 1);
+        assert_eq!(
+            panel.windows.values().next(),
+            Some(&SurfaceRole::Popover(PopoverKind::AntigravityUsage))
+        );
+    }
+
+    /// An antigravity usage-popover surface renders its content — the
+    /// `popover_view` arm for the new kind.
+    #[test]
+    fn a_registered_antigravity_usage_popover_surface_renders() {
+        let mut panel = test_panel();
+        let id = window::Id::unique();
+        panel
+            .windows
+            .insert(id, SurfaceRole::Popover(PopoverKind::AntigravityUsage));
+        let _: Element<'_, Message> = panel.view(id);
+    }
+
+    /// The right region's split: `claude`, `antigravity`, `tray` and
+    /// `notifications` leave the status cluster wherever the config listed
+    /// them; everything else stays, in order.
+    #[test]
+    fn the_right_region_split_extracts_the_four_standalone_groups() {
         let panel = test_panel();
-        let (cluster, claude_listed, tray_listed) = panel.right_region_split();
+        let (cluster, claude_listed, antigravity_listed, tray_listed, notifications_listed) =
+            panel.right_region_split();
         assert_eq!(
             cluster,
             vec![
@@ -3745,7 +4067,9 @@ mod tests {
             ]
         );
         assert!(claude_listed);
+        assert!(antigravity_listed);
         assert!(tray_listed);
+        assert!(notifications_listed);
 
         // A config that drops them reports them unlisted — no phantom
         // trigger group for a module the user removed.
@@ -3753,10 +4077,46 @@ mod tests {
             right: vec![config::ModuleName::Battery],
             ..config::PanelConfig::default()
         });
-        let (cluster, claude_listed, tray_listed) = trimmed.right_region_split();
+        let (cluster, claude_listed, antigravity_listed, tray_listed, notifications_listed) =
+            trimmed.right_region_split();
         assert_eq!(cluster, vec![config::ModuleName::Battery]);
         assert!(!claude_listed);
+        assert!(!antigravity_listed);
         assert!(!tray_listed);
+        assert!(!notifications_listed);
+
+        // Each standalone group is independent: listing one and not the
+        // others must not drag the missing ones in (nor push them into the
+        // status cluster).
+        let agy_only = panel_with(config::PanelConfig {
+            right: vec![config::ModuleName::Antigravity, config::ModuleName::Battery],
+            ..config::PanelConfig::default()
+        });
+        let (cluster, claude_listed, antigravity_listed, tray_listed, notifications_listed) =
+            agy_only.right_region_split();
+        assert_eq!(cluster, vec![config::ModuleName::Battery]);
+        assert!(!claude_listed);
+        assert!(antigravity_listed);
+        assert!(!tray_listed);
+        assert!(!notifications_listed);
+
+        // And the bell on its own, since it is the one group rendered to the
+        // *right* of the status cluster — a split that reported it as part of
+        // the cluster would silently move it and change its click meaning.
+        let bell_only = panel_with(config::PanelConfig {
+            right: vec![
+                config::ModuleName::Notifications,
+                config::ModuleName::Battery,
+            ],
+            ..config::PanelConfig::default()
+        });
+        let (cluster, claude_listed, antigravity_listed, tray_listed, notifications_listed) =
+            bell_only.right_region_split();
+        assert_eq!(cluster, vec![config::ModuleName::Battery]);
+        assert!(!claude_listed);
+        assert!(!antigravity_listed);
+        assert!(!tray_listed);
+        assert!(notifications_listed);
     }
 
     // ---- Stage 21: tray menus via popovers ------------------------------

@@ -13,7 +13,7 @@
 //! `saola-theme`'s TOML files). Two reasons, both from PLAN.md Stage 14:
 //! explicit walks are what a newer-to-Rust reader can trace line by line
 //! (CLAUDE.md's teaching-note rule), and a hand-written extractor can give
-//! *precise* per-knob warnings ("unknown module `notifications` in `right`
+//! *precise* per-knob warnings ("unknown module `weather` in `right`
 //! — skipped") that a derive macro's one-shot "deserialize failed" error
 //! cannot.
 //!
@@ -37,10 +37,10 @@
 //!   an `ink` that isn't `"#RRGGBB"`, …) → warn on that one knob, keep
 //!   parsing the rest of the document, and default just that knob. A typo
 //!   in `colors { }` must not blank out `left { }`.
-//! - **Unknown module name** in a `left`/`center`/`right` list (the style
-//!   guide's own sketch includes `notifications`, which this phase
-//!   excludes per PLAN.md — see [`ModuleName::parse`]) → warn + skip that
-//!   one entry; the rest of the list still loads.
+//! - **Unknown module name** in a `left`/`center`/`right` list (a typo, or a
+//!   module a *newer* `panel.kdl` names that this build predates — see
+//!   [`ModuleName::parse`]) → warn + skip that one entry; the rest of the
+//!   list still loads.
 //!
 //! Every one of these paths is unit-tested below (`default_config_parses`,
 //! `full_config_parses`, `partial_config_parses`, `garbage_falls_back_to_defaults`,
@@ -108,15 +108,17 @@ pub enum Edge {
     Bottom,
 }
 
-/// Every module name this phase recognizes in a `left`/`center`/`right`
-/// list, per PLAN.md Stage 14's list: `mark`, `window-title`, `mpris`,
-/// `clock`, `niri-columns`, `volume`, `network`, `bluetooth`, `battery`,
-/// `claude`, `tray`.
+/// Every module name recognized in a `left`/`center`/`right` list: `mark`,
+/// `window-title`, `mpris`, `clock`, `niri-columns`, `volume`, `network`,
+/// `bluetooth`, `battery`, `claude`, `antigravity`, `tray`, `notifications`
+/// (the first eleven from PLAN.md Stage 14's list, plus `antigravity` from
+/// Phase 3 and `notifications` from Phase 4).
 ///
-/// `notifications` (present in the style guide's own `panel { }` sketch) is
-/// **deliberately absent** — Phase 2 excludes everything notifications
-/// (CLAUDE.md, PLAN.md) — so it falls through [`ModuleName::parse`]'s `None`
-/// arm and is warned-and-skipped exactly like a typo would be.
+/// The style guide's own `panel { }` sketch is now fully covered: every name
+/// it lists has a variant here and a live `Panel::module_view` arm. A name
+/// this enum doesn't know is therefore a typo (or a knob from a newer
+/// `panel.kdl` than this build), and falls through [`ModuleName::parse`]'s
+/// `None` arm to be warned-and-skipped.
 ///
 /// [`Tray`] was recognized here before `src/modules/tray/` existed, so that a
 /// `panel.kdl` written against the style guide's own sketch kept parsing
@@ -141,7 +143,31 @@ pub enum ModuleName {
     Bluetooth,
     Battery,
     Claude,
+    /// The Antigravity (`agy`) session-dot row — Claude Code's sibling, its
+    /// own standalone group immediately right of `claude` (Phase 3,
+    /// 2026-08-14). Deliberately its own module rather than a shared "agents"
+    /// one: two agents, two interfaces, two dot rows.
+    ///
+    /// **No `antigravity-icon` counterpart to [`ClaudeIcon`]**, and that
+    /// asymmetry is intentional rather than an oversight: `claude-icon` exists
+    /// only because Claude Code ships *two* brand marks worth choosing between
+    /// (the Anthropic "A" and Claude Code's terminal window). Antigravity
+    /// ships one, so there is nothing for a knob to choose and
+    /// `modules::antigravity` names `icons::Icon::Antigravity` directly.
+    Antigravity,
     Tray,
+    /// The notification indicator (Phase 4, 2026-09-05) — the bell, its count,
+    /// and the two clicks that reach `saola-notifications`. **Rendered last in
+    /// the right region regardless of where it appears in the list**, like
+    /// `claude`/`antigravity`/`tray`: `main.rs`'s `Panel::right_region_split`
+    /// pulls all four out of the status cluster and lays them down in a fixed
+    /// order, which puts the bell at the trailing end — directly above where
+    /// the daemon anchors its centre.
+    ///
+    /// The bar hosts no notification surface: popups and the centre are the
+    /// daemon's own layer-shell windows, and this module is a readout plus two
+    /// remote calls (see `modules::notifications`).
+    Notifications,
 }
 
 impl ModuleName {
@@ -161,7 +187,9 @@ impl ModuleName {
             "bluetooth" => Some(Self::Bluetooth),
             "battery" => Some(Self::Battery),
             "claude" => Some(Self::Claude),
+            "antigravity" => Some(Self::Antigravity),
             "tray" => Some(Self::Tray),
+            "notifications" => Some(Self::Notifications),
             _ => None,
         }
     }
@@ -448,15 +476,20 @@ pub struct PanelConfig {
 impl Default for PanelConfig {
     /// The style guide's own module order: mark+window-title left,
     /// clock+niri-columns center,
-    /// mpris/volume/network/bluetooth/battery/claude/tray right (media
-    /// moved here from the left region on 2026-08-01 — style guide §7,
+    /// mpris/volume/network/bluetooth/battery/claude/antigravity/tray/
+    /// notifications right
+    /// (media moved here from the left region on 2026-08-01 — style guide §7,
     /// "Media is a status glyph" — and heads the cluster, ahead of
     /// volume; Bluetooth sits with the other radios, immediately after
-    /// Wi-Fi; `claude` and `tray` close the region — and `main.rs` renders
-    /// those two as standalone groups *beside* the status cluster rather
-    /// than inside it, see `Panel::bar_view`'s right-region split, decided
-    /// 2026-08-01: the Claude Code dots are their own island immediately
-    /// left of the tray). Top edge, ledger style, the built-in horns mark
+    /// Wi-Fi; `claude`, `antigravity` and `tray` close the region — and
+    /// `main.rs` renders those three as standalone groups *beside* the status
+    /// cluster rather than inside it, see `Panel::bar_view`'s right-region
+    /// split, decided 2026-08-01 and extended 2026-08-14: the Claude Code
+    /// dots are their own island, the Antigravity dots another immediately
+    /// right of them, both left of the tray — and `notifications`, added
+    /// 2026-09-05, closes the list as the fourth such group at the very
+    /// trailing end). Top edge, ledger style, the
+    /// built-in horns mark
     /// clicking through to `fuzzel` ([`DEFAULT_LAUNCHER`]), no color
     /// overrides. This is also what an absent `panel.kdl` produces, and
     /// what a garbage one falls back to in full.
@@ -475,7 +508,9 @@ impl Default for PanelConfig {
                 ModuleName::Bluetooth,
                 ModuleName::Battery,
                 ModuleName::Claude,
+                ModuleName::Antigravity,
                 ModuleName::Tray,
+                ModuleName::Notifications,
             ],
             mark: MarkSource::BuiltinHorns,
             launcher: Some(DEFAULT_LAUNCHER.to_string()),
@@ -1071,7 +1106,7 @@ mod tests {
 
                 left   { mark; window-title; mpris }
                 center { clock; niri-columns }
-                right  { volume; network; bluetooth; battery; claude; tray }
+                right  { volume; network; bluetooth; battery; claude; antigravity; tray }
 
                 mark "builtin:notch"
                 launcher "wofi --show drun"
@@ -1104,6 +1139,7 @@ mod tests {
                 ModuleName::Bluetooth,
                 ModuleName::Battery,
                 ModuleName::Claude,
+                ModuleName::Antigravity,
                 ModuleName::Tray,
             ]
         );
@@ -1236,7 +1272,7 @@ mod tests {
     fn unknown_module_is_skipped_with_the_rest_of_the_list_intact() {
         let kdl = r##"
             panel {
-                right { volume; notifications; battery }
+                right { volume; weather; battery }
             }
         "##;
         let config = PanelConfig::parse(kdl).expect("well-formed KDL");
@@ -1244,7 +1280,7 @@ mod tests {
         assert_eq!(
             config.right,
             vec![ModuleName::Volume, ModuleName::Battery],
-            "the unknown \"notifications\" entry should be dropped, not the whole list"
+            "the unknown \"weather\" entry should be dropped, not the whole list"
         );
     }
 
@@ -1284,10 +1320,19 @@ mod tests {
         assert_eq!(ModuleName::parse("bluetooth"), Some(ModuleName::Bluetooth));
         assert_eq!(ModuleName::parse("battery"), Some(ModuleName::Battery));
         assert_eq!(ModuleName::parse("claude"), Some(ModuleName::Claude));
+        assert_eq!(
+            ModuleName::parse("antigravity"),
+            Some(ModuleName::Antigravity)
+        );
         assert_eq!(ModuleName::parse("tray"), Some(ModuleName::Tray));
-        // Excluded this phase (CLAUDE.md, PLAN.md Stage 14) despite
-        // appearing in the style guide's own sketch.
-        assert_eq!(ModuleName::parse("notifications"), None);
+        assert_eq!(
+            ModuleName::parse("notifications"),
+            Some(ModuleName::Notifications)
+        );
+        // Every name in the style guide's own sketch now maps to a real
+        // module, so the `None` arm's job is typos and names from a newer
+        // `panel.kdl` than this build.
+        assert_eq!(ModuleName::parse("weather"), None);
         assert_eq!(ModuleName::parse("not-a-real-module"), None);
     }
 
