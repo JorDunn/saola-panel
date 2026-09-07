@@ -190,11 +190,11 @@ fn main() -> iced_layershell::Result {
     // application starts (bar height, default font) — `Panel` gets its own
     // clone below rather than a borrow, which keeps the `Panel::new` boot
     // closure simple (see the `daemon(..)` call). `colors { }` overrides are
-    // applied here, to the *only* `Theme` this process ever builds from
-    // `Theme::saola()` — both `main`'s own use of `theme` and the clone
-    // `Panel` gets afterward see the override applied exactly once.
-    let mut theme = Theme::saola();
-    config.colors.apply(&mut theme.palette);
+    // applied here, via `config::build_theme` (built-in palette + overrides,
+    // then `Theme::with_palette` re-derives the on-surface roles) — both
+    // `main`'s own use of `theme` and the clone `Panel` gets afterward see
+    // the override applied exactly once.
+    let theme = config::build_theme(&config.colors);
 
     // The one surface `Settings` creates at boot is the whole panel: the
     // ledger bar in ledger style, the islands strip in islands style (see
@@ -1798,9 +1798,9 @@ impl Panel {
     ///    when the geometry actually changed) is simpler and more honest
     ///    than teaching every popover to migrate; reopening is one click.
     ///
-    /// The theme is rebuilt **from `Theme::saola()`**, not by mutating
-    /// `self.theme`: `ColorOverrides::apply` only writes the fields that are
-    /// `Some`, so applying a new config's overrides onto the already-
+    /// The theme is rebuilt **via `config::build_theme`**, not by mutating
+    /// `self.theme`: `build_theme` starts from a fresh `Palette::default()`
+    /// every time, so applying a new config's overrides onto the already-
     /// overridden palette could never *revert* a color the user deleted from
     /// `colors { }`.
     ///
@@ -1817,8 +1817,7 @@ impl Panel {
             return Task::none();
         }
 
-        let mut theme = Theme::saola();
-        new_config.colors.apply(&mut theme.palette);
+        let theme = config::build_theme(&new_config.colors);
 
         self.mark = Mark::new(new_config.mark.clone(), new_config.launcher.clone());
         self.window_title.set_config(new_config.window_title);

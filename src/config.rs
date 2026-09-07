@@ -61,25 +61,27 @@
 //! # How `colors { }` reaches the theme
 //!
 //! [`ColorOverrides::apply`] mutates a `saola_theme::tokens::Palette` in
-//! place — `main.rs` calls it once, on `Theme::saola()`'s own `palette`
-//! field, before `Panel::new` ever runs. This works because
-//! `saola_tokens::Palette` (and the rest of `Theme`) is **plain data**: no
-//! trait objects, no interior mutability, nothing that would make "swap out
-//! three fields after construction" awkward. Only `palette.{ink,paper,
-//! accent}` are exposed as override knobs — matching the style guide's
-//! `colors { ink; paper; accent }` sketch — never `on_ink`/`on_paper` (the
-//! alpha-stepped role tables): those are derived from the *built-in* ivory
-//! and ink at fixed alpha steps (`OnSurface::on_ink`/`on_paper` in
-//! `saola-tokens`), not recomputed from a custom palette, so a `colors { }`
-//! override changes the three identity colors but not (yet) the text/fill
-//! roles layered on top of them — a known limitation of the theme crate,
-//! not something this module works around.
+//! place, and [`build_theme`] is the one place that palette turns into a
+//! whole `Theme` — `main.rs` calls it once at boot and once on every config
+//! reload, never building a `Theme` from overrides any other way. Only
+//! `palette.{ink,paper,accent}` are exposed as override knobs — matching the
+//! style guide's `colors { ink; paper; accent }` sketch — but the
+//! `on_ink`/`on_paper` alpha-stepped role tables are no longer stuck at
+//! their built-in values: `saola-theme` v0.6.0 added `Theme::with_palette`,
+//! which re-derives `on_ink` from the (possibly overridden) `paper`,
+//! `on_paper` from the (possibly overridden) `ink`, and every scrim from
+//! `ink` — the same ladders `Theme::saola()` itself uses, just re-stepped
+//! from custom colors. [`build_theme`] applies the overrides to a fresh
+//! `Palette::default()` and hands the result to `with_palette`, so a
+//! `colors { }` override now reaches every text/divider/fill role built on
+//! top of the three identity colors, not just the identity colors
+//! themselves.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use kdl::{KdlDocument, KdlValue};
-use saola_theme::tokens::{Color, Palette};
+use saola_theme::tokens::{Color, Palette, Theme};
 
 /// The two panel layouts the style guide defines (§7/§10). Only [`Ledger`]
 /// actually renders today — `Panel::bar_view` is Ledger-shaped and Stage 15
@@ -426,6 +428,24 @@ impl ColorOverrides {
             palette.accent = accent;
         }
     }
+}
+
+/// Builds a whole [`Theme`] from `colors { }` overrides: starts from the
+/// built-in palette, applies whichever fields `colors` set
+/// ([`ColorOverrides::apply`]), then hands the result to
+/// `Theme::with_palette` so the alpha-stepped `on_ink`/`on_paper` roles and
+/// every scrim are re-derived from the (possibly overridden) colors instead
+/// of staying pinned to the built-in ivory/ink — see the module doc
+/// comment's "How `colors { }` reaches the theme" section.
+///
+/// With no overrides set, `colors` leaves `Palette::default()` untouched,
+/// and `Theme::with_palette(Palette::default())` is exactly `Theme::saola()`
+/// — so a stock config (no `colors { }` block at all) produces the same
+/// theme it always did.
+pub fn build_theme(colors: &ColorOverrides) -> Theme {
+    let mut palette = Palette::default();
+    colors.apply(&mut palette);
+    Theme::with_palette(palette)
 }
 
 /// The whole of `panel.kdl`, resolved to typed values — loaded at boot
@@ -1525,6 +1545,33 @@ mod tests {
             "unset fields must be left alone"
         );
         assert_eq!(palette.accent, Color::parse_hex("#abcdef").unwrap());
+    }
+
+    /// No `colors { }` overrides at all must build the exact same theme as
+    /// `Theme::saola()` — proves `build_theme` doesn't accidentally perturb
+    /// the stock theme just by routing it through `with_palette`.
+    #[test]
+    fn build_theme_with_no_overrides_matches_saola() {
+        let theme = build_theme(&ColorOverrides::default());
+        assert_eq!(theme, Theme::saola());
+    }
+
+    /// Overriding `ink`/`paper` must reach the alpha-stepped on-surface
+    /// roles, not just the three identity colors — this is the behavior
+    /// that closed the "known limitation" the module doc comment used to
+    /// describe.
+    #[test]
+    fn build_theme_rederives_on_surface_roles_from_overrides() {
+        let overrides = ColorOverrides {
+            ink: Some(Color::parse_hex("#123456").unwrap()),
+            paper: Some(Color::parse_hex("#abcdef").unwrap()),
+            accent: None,
+        };
+        let theme = build_theme(&overrides);
+        let stock = Theme::saola();
+
+        assert_ne!(theme.on_ink, stock.on_ink);
+        assert_ne!(theme.on_paper, stock.on_paper);
     }
 
     /// A bad color string in `colors { }` warns and leaves that one field
