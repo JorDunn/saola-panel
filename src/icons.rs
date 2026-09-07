@@ -98,8 +98,8 @@ pub enum Icon {
     /// trigger's icon.
     Anthropic,
     /// The Claude Code module's alternative bar glyph: Claude Code's own
-    /// terminal-window mark, chosen by `claude-icon "claude-code"` in
-    /// `panel.kdl` (see `crate::config::ClaudeIcon`). The second brand
+    /// terminal-window mark, chosen by `claude-icon = "claude-code"` in
+    /// `panel.toml` (see `crate::config::ClaudeIcon`). The second brand
     /// asset, same treatment as [`Anthropic`][Icon::Anthropic] above:
     /// solid-filled, no baked-in brand color, theme-tinted at view time.
     ClaudeCode,
@@ -126,7 +126,7 @@ pub enum Icon {
     /// The default Saola mark: two splaying strokes ("horns"), style guide §8.
     MarkHorns,
     /// The alternative mark: a broken ring with a dot at the break, style
-    /// guide §8. Chosen by `mark "builtin:notch"` in `panel.kdl`: the config
+    /// guide §8. Chosen by `mark = "builtin:notch"` in `panel.toml`: the config
     /// stage delivered on Stage 8's promise, so `crate::config` parses that
     /// string into `MarkSource::BuiltinNotch` and `mark.rs` renders this
     /// variant for it — `MarkHorns` above stays the default when the setting

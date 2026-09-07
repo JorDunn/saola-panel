@@ -532,26 +532,29 @@ One line: `[user] / [path] / [git]  ❯ command`, with the right prompt (`toolch
 
 The two panel styles are one renderer with two layout passes, sharing one module list:
 
-```kdl
-panel {
-  style "islands"          // or "ledger"
-  edge "top"
-  margin 26
-  height 40
+```toml
+# Saola components read TOML (panel.toml, notifications.toml) resolved from
+# $SAOLA_CONFIG_DIR, then $XDG_CONFIG_HOME/saola, then ~/.config/saola.
 
-  left   { mark; window-title }
-  center { clock; niri-columns }
-  right  { mpris; volume; network; battery; tray; notifications }
+style = "islands"          # or "ledger"
+edge = "top"
+margin = 26
+height = 40
 
-  window-title {
-    max-chars 50           // cap before the overflow mode applies
-    overflow "truncate"    // or "marquee" — the opt-in loop, timing in §5
-  }
+left   = ["mark", "window-title"]
+center = ["clock", "niri-columns"]
+right  = ["mpris", "volume", "network", "battery", "tray", "notifications"]
 
-  mark "builtin:horns"     // or "builtin:notch", "file:~/.icons/arch.svg", "none"
+mark = "builtin:horns"     # or "builtin:notch", "file:~/.icons/arch.svg", "none"
 
-  colors { ink "#0C0A00"; paper "#FFFFF0"; accent "#C67139" }
-}
+[window-title]
+max-chars = 50              # cap before the overflow mode applies
+overflow = "truncate"       # or "marquee" — the opt-in loop, timing in §5
+
+[colors]
+ink = "#0C0A00"
+paper = "#FFFFF0"
+accent = "#C67139"
 ```
 
 Every module maps to a **signal, not a poll** — niri IPC, `org.freedesktop.UPower`,

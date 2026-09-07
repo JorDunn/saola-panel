@@ -55,7 +55,7 @@ pub enum Message {
 /// Seven full dashes plus two stubs per end is ~318 px of strip, which fits
 /// beside the clock in the centre region without crowding it.
 ///
-/// Stage 18 (KDL config) is the natural place to make this a user knob; until
+/// The TOML config (`panel.toml`) is the natural place to make this a user knob; until
 /// then a single named constant beats a magic number buried in the algorithm.
 const MAX_FULL_DASHES: usize = 7;
 

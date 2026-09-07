@@ -1,0 +1,165 @@
+# saola-panel configuration — panel.toml
+#
+# This is documentation, not the live config: the panel never reads this
+# file. Copy whichever parts you want into your own config at
+# <config-dir>/panel.toml, where the directory resolves most-specific-first:
+# the --config-dir flag, then $SAOLA_CONFIG_DIR, then
+# $XDG_CONFIG_HOME/saola, then ~/.config/saola (the usual place). The
+# panel reads that path at boot and watches it afterwards, so edits apply
+# live on save (a save that doesn't parse keeps the running config and
+# warns on stderr; deleting the file reverts to the defaults).
+#
+# Every knob below is optional. If a knob (or the whole file) is missing,
+# the panel falls back to exactly the values shown here — this example
+# *is* the built-in default, written out for reference, not a
+# recommendation to override everything. Three knobs (`margin`, `height`
+# and the whole [colors] block) are shown *commented out*: their defaults
+# are design-system tokens rather than fixed numbers, so writing them here
+# would pin values the theme is meant to own. A unit test parses this very
+# file and asserts it produces the built-in defaults, so what you read
+# here cannot drift from what the panel does. If the file fails to parse at
+# all, the panel prints one warning to stderr and starts with these same
+# defaults rather than refusing to run: a status bar must never fail to
+# start over a config typo. A single bad knob (an unrecognized `style`, an
+# `ink` that isn't a real hex color, an unknown module name in a list)
+# only resets *that* knob to its default and prints its own warning — it
+# does not throw away the rest of the file.
+#
+# There is no [panel] wrapper table: every knob is a bare top-level key,
+# the same shape every other Saola component's config file has. The two
+# nested blocks ([window-title] and [colors]) come last, because a TOML
+# table header ends the top-level section — any bare key written after
+# them would belong to that table instead.
+
+# The two layouts the Saola design system defines. "ledger" is one
+# floating ink pill spanning the screen (the default, and what you're
+# reading the settings for). "islands" splits it into three separate ink
+# pill clusters — one per region below — each its own layer-shell surface,
+# with the wallpaper showing through between them.
+style = "ledger" # or "islands"
+
+# Which screen edge the bar anchors to. This replaced the old `--bottom`
+# command-line flag as the file knob for it; the flag is back as a
+# per-run override, and a flag always beats the file.
+edge = "top" # or "bottom"
+
+# The panel's inset from the screen edge, in logical pixels — how far the
+# floating bar (or each island pill) stops short of the left and right
+# screen edges. An integer or a decimal both work.
+#
+# Left commented out, unlike the knobs above: its default is not a number
+# at all but a design-system token (the panel asks the theme for the
+# margin its current style wants — 20 today). Writing a number here pins
+# it against a theme that may later say otherwise, so set it only if you
+# actually want to override the design system.
+# margin = 20
+
+# The bar's height, in logical pixels — and, with it, the compositor
+# exclusive zone reserved along the anchored edge so tiled windows don't
+# sit underneath the panel (the compositor adds the edge gap to that zone
+# itself, so ledger reserves 48 + 18 = 66 px). In islands mode this knob
+# sets each island pill's height instead.
+#
+# Commented out for the same reason as `margin`: the default is the
+# theme's own token (48 for the ledger bar, the shorter 40 for an island
+# pill), and leaving the key out is what lets the panel keep asking the
+# theme instead of holding a number that was right on the day it was
+# written.
+# height = 48
+
+# The three regions, left to right (or, in islands mode, the three
+# separate island surfaces). Each is an array of module names in display
+# order — reorder, add, or remove freely. Recognized names this release:
+# mark, window-title, mpris, clock, niri-columns, volume, network,
+# bluetooth, battery, claude, antigravity, tray, notifications. An unknown
+# name (a typo, say) is skipped with a warning; the rest of the array
+# still loads. An empty array means "nothing in this region", which is not
+# the same as leaving the key out (that keeps the default region).
+#
+# `mpris` is a status-cluster glyph, not a left-region pill (style
+# guide §7, "Media is a status glyph", 2026-08-01): present only while
+# an MPRIS player exists, a solid play glyph in terracotta while
+# playing and ivory while paused, with title/artist/transport living in
+# the quick-settings popover's media row rather than on the bar itself.
+# It heads the right region below, ahead of volume — reorder it like
+# any other name if you'd rather it sit elsewhere in the cluster.
+#
+# Four right-region names are special-cased by the layout: `claude` (the
+# Claude Code session dots), `antigravity` (the Antigravity session dots),
+# `tray`, and `notifications` (the bell and its count) each render as their
+# own standalone group — their own island pill in islands style — beside
+# the status cluster rather than inside it, in that fixed order: status
+# cluster, then claude, then antigravity, then tray, then notifications.
+# Clicking the claude group opens its usage popover; clicking the bell
+# reaches the saola-notifications daemon; clicking anywhere else in the
+# status cluster (mpris's glyph included) opens quick settings.
+left   = ["mark", "window-title"]
+center = ["clock", "niri-columns"]
+right  = ["mpris", "volume", "network", "bluetooth", "battery", "claude", "antigravity", "tray", "notifications"]
+
+# Where the bar's mark glyph (the small logo in the left region, next
+# to whatever "mark" resolves to in the module arrays above) comes
+# from:
+#   "builtin:horns"          - the default Saola mark (shown here)
+#   "builtin:notch"          - the alternative built-in mark
+#   "file:~/.icons/arch.svg" - your own SVG; `~` expands to $HOME
+#   "none"                   - no mark glyph at all
+mark = "builtin:horns"
+
+# Which command clicking the mark glyph runs. A plain command line,
+# split on whitespace — the first word is the program, the rest are
+# its arguments (no shell: no quoting, no pipes, no `$HOME`
+# expansion). "none" disables the click behavior entirely, leaving
+# the mark exactly as inert as it was before this knob existed.
+#   "fuzzel"               - the default app launcher (shown here)
+#   "wofi --show drun"     - a launcher that takes its own arguments
+#   "none"                 - no click behavior at all
+launcher = "fuzzel"
+
+# Which glyph heads the Claude Code module's row of session dots (and
+# the usage-popover trigger it doubles as). Both are built-in brand
+# marks, drawn in the same theme ivory as every other bar icon:
+#   "anthropic"   - the Anthropic "A" mark (the default, shown here)
+#   "claude-code" - Claude Code's own terminal-window mark
+claude-icon = "anthropic"
+
+# The focused window's title — the quiet text the "window-title" module
+# draws beside the mark (in islands mode it takes an island of its own
+# next to the mark's, appearing and vanishing with focus). It shows nothing
+# at all when no window has focus or the focused window has a blank title,
+# and it updates from niri's event stream, never from a timer.
+#
+#   max-chars - how long a title may get before it is cut, counted in
+#               characters (not pixels: an approximation under a
+#               proportional face, but the number a human can reason
+#               about). Must be a positive whole number.
+#   overflow  - what happens to a title longer than that:
+#                 "truncate" - cut it, ending in a single "…" (the
+#                              default, and the only motionless option)
+#                 "marquee"  - the opt-in ping-pong scroll: dwell 2s,
+#                              sweep at 24px/s, dwell 2s, sweep back,
+#                              repeat. Translation only — nothing fades
+#                              or scales, and the title never wraps.
+#                              The panel's only animation besides the
+#                              session-dot breath, and it runs *only*
+#                              while an overflowing title is actually on
+#                              screen: a title that fits, or a window
+#                              losing focus, renders exactly like
+#                              "truncate" and ticks nothing.
+[window-title]
+max-chars = 50
+overflow = "truncate" # or "marquee"
+
+# Overrides for the three identity colors (ink = every shell surface,
+# paper = a control at rest, accent = on/selected/live). Each is
+# independently optional — set only the ones you want to change.
+# Values are "#RRGGBB" or "#RRGGBBAA" hex strings; anything else logs
+# a warning and that one color keeps its built-in value.
+#
+# Commented out, like `margin` and `height` above and for the same
+# reason: the values shown are today's Saola identity colors, which the
+# theme owns. Uncomment a line only to override that color for good.
+# [colors]
+# ink = "#0C0A00"
+# paper = "#FFFFF0"
+# accent = "#C67139"

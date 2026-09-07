@@ -363,7 +363,7 @@ impl Sessions {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ClaudeCode {
     /// Which brand mark heads the dot row — the `claude-icon` knob from
-    /// `panel.kdl`, resolved at boot ([`ClaudeCode::new`]) and swapped in
+    /// `panel.toml`, resolved at boot ([`ClaudeCode::new`]) and swapped in
     /// place on a live config reload ([`ClaudeCode::set_icon`]). The
     /// same "config picks, module renders" split as `modules::mark`'s
     /// `source` field; defaults to the Anthropic mark.

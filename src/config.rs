@@ -1,50 +1,102 @@
-//! `panel.kdl` — the user-facing knobs for layout, module placement, the
+//! `panel.toml` — the user-facing knobs for layout, module placement, the
 //! mark (and its launcher), and color overrides (style guide §10; PLAN.md
 //! Stage 14).
 //!
-//! # Why `kdl`, and why by hand (teaching note)
+//! # Why `toml`, and why by hand (teaching note)
 //!
-//! [`kdl`] is the reference Rust implementation of the
-//! [KDL](https://kdl.dev) document language — the format the style guide's
-//! own `panel { }` sketch is written in. This module walks the parsed
-//! [`KdlDocument`] explicitly (`document.get("panel")`, then
-//! `.get_arg("style")`, `.children()`, …) instead of reaching for a
-//! derive-macro-based deserializer (the way `serde` does for
-//! `saola-theme`'s TOML files). Two reasons, both from PLAN.md Stage 14:
-//! explicit walks are what a newer-to-Rust reader can trace line by line
-//! (CLAUDE.md's teaching-note rule), and a hand-written extractor can give
-//! *precise* per-knob warnings ("unknown module `weather` in `right`
-//! — skipped") that a derive macro's one-shot "deserialize failed" error
-//! cannot.
+//! **2026-09-07**: this module read a `panel.kdl` from Stage 14 through
+//! Phase 4. The Saola family then settled on one config format for every
+//! component — saola-capture moved first (2026-08-08), and saola-files,
+//! saola-greeter and saola-notifications followed — so the panel's file is
+//! now `panel.toml`. Only the *format* changed: the parsing posture below
+//! is the same one the KDL version had.
+//!
+//! [`toml`] parses a document into a generic value tree, and this module
+//! walks that tree explicitly ([`Table::get`], then `.as_str()`,
+//! `.as_array()`, `.as_table()`, …) instead of reaching for a derive-macro
+//! deserializer (`#[derive(serde::Deserialize)]` on [`PanelConfig`] itself,
+//! the way `serde` does for `saola-theme`'s token files). Two reasons, both
+//! inherited from PLAN.md Stage 14: explicit walks are what a newer-to-Rust
+//! reader can trace line by line (CLAUDE.md's teaching-note rule), and a
+//! hand-written extractor can give *precise* per-knob warnings ("unknown
+//! module `weather` in `right` — skipped") that a derive macro's one-shot
+//! "deserialize failed" error cannot.
+//!
+//! `toml`'s default features do pull `serde` in — that is how [`Table`] and
+//! `toml::Value` get their own `Deserialize` impls — but that is `toml`
+//! deserializing into its own generic value tree, not this module deriving
+//! anything on [`PanelConfig`]. The crate is pinned to the `0.9` line rather
+//! than the newer `1.x` so it unifies with the `toml` that `saola-theme`'s
+//! `saola-tokens` already compiles into this binary; see `Cargo.toml`'s
+//! dependency note.
+//!
+//! # No wrapper table (a deliberate schema choice)
+//!
+//! The KDL file wrapped every knob in a top-level `panel { }` node. TOML has
+//! no reason to copy that: `panel.toml` is already this program's own file,
+//! so every knob is a **bare top-level key** (`style = "islands"`, not
+//! `[panel]` then `style = "islands"`) — one less level to walk and to
+//! hand-write, and the same shape every other Saola component's config has.
+//! TOML's bare-key grammar allows `-` alongside alphanumerics and `_`, so
+//! the kebab-case knob names (`claude-icon`, `max-chars`, `window-title`)
+//! carry over from the KDL schema unquoted and unchanged. The two nested
+//! blocks become tables:
+//!
+//! ```toml
+//! style = "ledger"
+//! edge = "top"
+//! left = ["mark", "window-title"]
+//!
+//! [window-title]
+//! max-chars = 50
+//! overflow = "truncate"
+//!
+//! [colors]
+//! accent = "#C67139"
+//! ```
 //!
 //! # Resilience rules (binding — see PLAN.md Stage 14 and CLAUDE.md)
 //!
 //! A status bar must never fail to start because of a config typo:
 //!
 //! - **No file at all** → [`PanelConfig::default`], silently. This is the
-//!   expected case for anyone who hasn't written a `panel.kdl` yet.
-//! - **File present but not valid KDL** ("garbage") → one `eprintln!`
+//!   expected case for anyone who hasn't written a `panel.toml` yet.
+//! - **File present but not valid TOML** ("garbage") → one `eprintln!`
 //!   warning naming the file and the parse error, then the **whole**
 //!   config falls back to [`PanelConfig::default`] — not a partial merge.
 //!   Unlike `saola_tokens::Theme`'s TOML loader (which lets a partial file
 //!   override just the fields it mentions, because `#[serde(default)]`
-//!   makes every *field* independently optional), a `panel.kdl` that
+//!   makes every *field* independently optional), a `panel.toml` that
 //!   doesn't even parse gives this module nothing safe to partially trust,
 //!   so it discards the whole attempt rather than guessing which half of a
 //!   syntactically broken document was "the good part".
 //! - **File parses, but a single knob's *value* is nonsense** (an
-//!   unrecognized `style`, an `mark` string that matches no known prefix,
-//!   an `ink` that isn't `"#RRGGBB"`, …) → warn on that one knob, keep
-//!   parsing the rest of the document, and default just that knob. A typo
-//!   in `colors { }` must not blank out `left { }`.
-//! - **Unknown module name** in a `left`/`center`/`right` list (a typo, or a
-//!   module a *newer* `panel.kdl` names that this build predates — see
+//!   unrecognized `style`, a `mark` string that matches no known prefix,
+//!   an `ink` that isn't `"#RRGGBB"`, a `left` that isn't an array, …) →
+//!   warn on that one knob, keep parsing the rest of the document, and
+//!   default just that knob. A typo in `[colors]` must not blank out
+//!   `left`.
+//! - **Unknown module name** in a `left`/`center`/`right` array (a typo, or
+//!   a module a *newer* `panel.toml` names that this build predates — see
 //!   [`ModuleName::parse`]) → warn + skip that one entry; the rest of the
-//!   list still loads.
+//!   array still loads.
+//! - **A `panel.kdl` is found but no `panel.toml`** → one migration hint
+//!   naming both paths, then defaults (a warning, not an error — see
+//!   [`warn_if_stale_kdl_sibling`]).
+//!
+//! Unknown *top-level* keys are ignored silently, the same posture the rest
+//! of the family takes: a key this build doesn't know is either a typo the
+//! user will notice by the knob not taking effect, or a knob from a newer
+//! release, and neither is worth a warning that would fire on every boot.
 //!
 //! Every one of these paths is unit-tested below (`default_config_parses`,
-//! `full_config_parses`, `partial_config_parses`, `garbage_falls_back_to_defaults`,
-//! `unknown_module_is_skipped_with_the_rest_of_the_list_intact`).
+//! `full_config_parses`, `partial_config_parses`, `garbage_is_rejected_by_parse`,
+//! `garbage_file_falls_back_to_defaults`,
+//! `unknown_module_is_skipped_with_the_rest_of_the_list_intact`,
+//! `a_non_array_module_list_keeps_the_default_list`,
+//! `a_non_string_list_entry_is_skipped_like_an_unknown_name`,
+//! `a_block_that_is_not_a_table_falls_back_to_its_defaults`,
+//! `missing_toml_with_a_stale_kdl_sibling_still_falls_back_to_defaults`).
 //!
 //! # How module lists become bar regions (read this before touching `main.rs`)
 //!
@@ -58,35 +110,34 @@
 //! internals — `main.rs`'s `match` is exhaustive over [`ModuleName`], so
 //! the compiler catches a forgotten arm the moment a variant is added here.
 //!
-//! # How `colors { }` reaches the theme
+//! # How `[colors]` reaches the theme
 //!
 //! [`ColorOverrides::apply`] mutates a `saola_theme::tokens::Palette` in
 //! place, and [`build_theme`] is the one place that palette turns into a
 //! whole `Theme` — `main.rs` calls it once at boot and once on every config
 //! reload, never building a `Theme` from overrides any other way. Only
 //! `palette.{ink,paper,accent}` are exposed as override knobs — matching the
-//! style guide's `colors { ink; paper; accent }` sketch — but the
-//! `on_ink`/`on_paper` alpha-stepped role tables are no longer stuck at
-//! their built-in values: `saola-theme` v0.6.0 added `Theme::with_palette`,
-//! which re-derives `on_ink` from the (possibly overridden) `paper`,
-//! `on_paper` from the (possibly overridden) `ink`, and every scrim from
-//! `ink` — the same ladders `Theme::saola()` itself uses, just re-stepped
-//! from custom colors. [`build_theme`] applies the overrides to a fresh
-//! `Palette::default()` and hands the result to `with_palette`, so a
-//! `colors { }` override now reaches every text/divider/fill role built on
-//! top of the three identity colors, not just the identity colors
-//! themselves.
+//! style guide's own three identity colors — but the `on_ink`/`on_paper`
+//! alpha-stepped role tables are no longer stuck at their built-in values:
+//! `saola-theme` v0.6.0 added `Theme::with_palette`, which re-derives
+//! `on_ink` from the (possibly overridden) `paper`, `on_paper` from the
+//! (possibly overridden) `ink`, and every scrim from `ink` — the same
+//! ladders `Theme::saola()` itself uses, just re-stepped from custom colors.
+//! [`build_theme`] applies the overrides to a fresh `Palette::default()` and
+//! hands the result to `with_palette`, so a `[colors]` override now reaches
+//! every text/divider/fill role built on top of the three identity colors,
+//! not just the identity colors themselves.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use kdl::{KdlDocument, KdlValue};
 use saola_theme::tokens::{Color, Palette, Theme};
+use toml::{Table, Value};
 
 /// The two panel layouts the style guide defines (§7/§10). Only [`Ledger`]
 /// actually renders today — `Panel::bar_view` is Ledger-shaped and Stage 15
 /// is what teaches `Panel::view` to draw Islands. This field exists *now*,
-/// ahead of that stage, precisely so Stage 15 reads `style "islands"` out
+/// ahead of that stage, precisely so Stage 15 reads `style = "islands"` out
 /// of a config knob that already exists rather than inventing a throwaway
 /// CLI flag first and migrating it later (PLAN.md Stage 14's own stated
 /// reason for this stage's placement in the plan).
@@ -100,8 +151,8 @@ pub enum PanelStyle {
 }
 
 /// Which screen edge the bar's layer-shell surface anchors to. Replaces the
-/// `--bottom` CLI flag (PLAN.md Stage 14, bullet 3) — `edge "bottom"` in
-/// `panel.kdl` is now the only way to flip it; `main.rs` no longer reads
+/// `--bottom` CLI flag (PLAN.md Stage 14, bullet 3) — `edge = "bottom"` in
+/// `panel.toml` is now the only way to flip it; `main.rs` no longer reads
 /// `std::env::args()` at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Edge {
@@ -110,21 +161,21 @@ pub enum Edge {
     Bottom,
 }
 
-/// Every module name recognized in a `left`/`center`/`right` list: `mark`,
+/// Every module name recognized in a `left`/`center`/`right` array: `mark`,
 /// `window-title`, `mpris`, `clock`, `niri-columns`, `volume`, `network`,
 /// `bluetooth`, `battery`, `claude`, `antigravity`, `tray`, `notifications`
 /// (the first eleven from PLAN.md Stage 14's list, plus `antigravity` from
 /// Phase 3 and `notifications` from Phase 4).
 ///
-/// The style guide's own `panel { }` sketch is now fully covered: every name
-/// it lists has a variant here and a live `Panel::module_view` arm. A name
+/// The style guide's own panel sketch is now fully covered: every name it
+/// lists has a variant here and a live `Panel::module_view` arm. A name
 /// this enum doesn't know is therefore a typo (or a knob from a newer
-/// `panel.kdl` than this build), and falls through [`ModuleName::parse`]'s
+/// `panel.toml` than this build), and falls through [`ModuleName::parse`]'s
 /// `None` arm to be warned-and-skipped.
 ///
 /// [`Tray`] was recognized here before `src/modules/tray/` existed, so that a
-/// `panel.kdl` written against the style guide's own sketch kept parsing
-/// cleanly in the meantime rather than needing an edit when Stage 18 landed.
+/// config written against the style guide's own sketch kept parsing cleanly
+/// in the meantime rather than needing an edit when Stage 18 landed.
 /// It now maps to the real module (`modules::tray`), and every name in this
 /// enum has a live `Panel::module_view` arm.
 ///
@@ -134,7 +185,7 @@ pub enum ModuleName {
     Mark,
     /// The focused window's title (style guide §7, 2026-08-01) — ambient text
     /// to the right of the mark. Its own knobs live in the top-level
-    /// `window-title { }` block, not here: this enum only says *where* a
+    /// `[window-title]` table, not here: this enum only says *where* a
     /// module sits (see [`WindowTitleConfig`]).
     WindowTitle,
     Mpris,
@@ -160,7 +211,7 @@ pub enum ModuleName {
     Tray,
     /// The notification indicator (Phase 4, 2026-09-05) — the bell, its count,
     /// and the two clicks that reach `saola-notifications`. **Rendered last in
-    /// the right region regardless of where it appears in the list**, like
+    /// the right region regardless of where it appears in the array**, like
     /// `claude`/`antigravity`/`tray`: `main.rs`'s `Panel::right_region_split`
     /// pulls all four out of the status cluster and lays them down in a fixed
     /// order, which puts the bell at the trailing end — directly above where
@@ -198,7 +249,7 @@ impl ModuleName {
 }
 
 /// Where the bar's mark glyph (style guide §8) comes from, chosen by the
-/// top-level `mark "…"` directive. Consumed by `modules::mark::Mark`, which
+/// top-level `mark = "…"` key. Consumed by `modules::mark::Mark`, which
 /// stores one of these and switches on it in `view` — see that module for
 /// how each variant actually reaches the screen (the two `Builtin*`
 /// variants route through `crate::icons`' embedded-asset machinery from
@@ -208,20 +259,20 @@ impl ModuleName {
 /// icons, and a user-supplied path is the opposite of that by definition).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MarkSource {
-    /// `mark "builtin:horns"` — the default Saola mark. Also the fallback
-    /// for an absent `mark` directive, matching today's hardcoded behavior.
+    /// `mark = "builtin:horns"` — the default Saola mark. Also the fallback
+    /// for an absent `mark` key, matching today's hardcoded behavior.
     #[default]
     BuiltinHorns,
-    /// `mark "builtin:notch"` — the alternative mark from style guide §8.
+    /// `mark = "builtin:notch"` — the alternative mark from style guide §8.
     BuiltinNotch,
-    /// `mark "file:~/.icons/arch.svg"` — an arbitrary user SVG. `~` is
+    /// `mark = "file:~/.icons/arch.svg"` — an arbitrary user SVG. `~` is
     /// expanded against `$HOME` at parse time (see [`expand_tilde`]); the
     /// file is not read until `Mark::view` builds an `svg::Handle` from it,
     /// so a path that doesn't exist yet is a render-time SVG error (handled
     /// by iced/resvg), not a config-parse error.
     File(PathBuf),
-    /// `mark "none"` — no mark at all. Distinct from simply leaving `mark`
-    /// out of a module list: this is "the mark module has nothing to draw",
+    /// `mark = "none"` — no mark at all. Distinct from simply leaving `mark`
+    /// out of a module array: this is "the mark module has nothing to draw",
     /// not "the mark module isn't in the bar".
     None,
 }
@@ -240,7 +291,7 @@ impl MarkSource {
 }
 
 /// Which glyph heads the Claude Code module's session-dot row, chosen by
-/// the top-level `claude-icon "…"` directive. A closed two-value set (like
+/// the top-level `claude-icon = "…"` key. A closed two-value set (like
 /// `style`/`edge`, unlike `mark`'s open `file:` form): both glyphs are
 /// embedded brand assets (`crate::icons::Icon::{Anthropic, ClaudeCode}`),
 /// and a user SVG here would be a third brand where the design language
@@ -251,12 +302,12 @@ impl MarkSource {
 /// as [`MarkSource`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClaudeIcon {
-    /// `claude-icon "anthropic"` — the Anthropic "A" mark. Also the
-    /// fallback for an absent directive, matching the default glyph the
-    /// module drew before this knob existed.
+    /// `claude-icon = "anthropic"` — the Anthropic "A" mark. Also the
+    /// fallback for an absent key, matching the default glyph the module
+    /// drew before this knob existed.
     #[default]
     Anthropic,
-    /// `claude-icon "claude-code"` — Claude Code's own terminal-window mark.
+    /// `claude-icon = "claude-code"` — Claude Code's own terminal-window mark.
     ClaudeCode,
 }
 
@@ -279,15 +330,16 @@ impl ClaudeIcon {
 /// doc comment's per-knob resilience rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TitleOverflow {
-    /// `overflow "truncate"` — cut at the limit with a single `…`, no motion.
-    /// The default, and the whole of a stock Saola desktop's behavior.
+    /// `overflow = "truncate"` — cut at the limit with a single `…`, no
+    /// motion. The default, and the whole of a stock Saola desktop's
+    /// behavior.
     #[default]
     Truncate,
-    /// `overflow "marquee"` — the opt-in ping-pong sweep (style guide §5:
+    /// `overflow = "marquee"` — the opt-in ping-pong sweep (style guide §5:
     /// 2s dwell, 24px/s linear, 2s dwell, back).
     ///
-    /// The one knob in `panel.kdl` that starts an animation, which is why it
-    /// is opt-in and why the module gates it so tightly: a title that fits
+    /// The one knob in `panel.toml` that starts an animation, which is why
+    /// it is opt-in and why the module gates it so tightly: a title that fits
     /// (or a window losing focus) renders exactly like
     /// [`Truncate`](Self::Truncate) and runs no timer at all. See
     /// `modules::window_title` for the state machine and the gate.
@@ -308,10 +360,9 @@ impl TitleOverflow {
 /// a configurable **character limit** (default `50`)").
 pub const DEFAULT_TITLE_MAX_CHARS: usize = 50;
 
-/// `window-title { max-chars 50; overflow "truncate" }` — the focused-window
-/// title's two knobs, resolved to concrete values (unlike `margin`/`height`,
-/// neither of these has a theme token to defer to, so there is no `Option`
-/// to resolve later).
+/// The `[window-title]` table — the focused-window title's two knobs,
+/// resolved to concrete values (unlike `margin`/`height`, neither of these
+/// has a theme token to defer to, so there is no `Option` to resolve later).
 ///
 /// `max_chars` is a count of **characters**, not pixels: approximate under a
 /// proportional face, but the knob a human can reason about (style guide §7).
@@ -332,7 +383,7 @@ impl Default for WindowTitleConfig {
     }
 }
 
-/// The built-in launcher command for an absent `launcher` directive — see
+/// The built-in launcher command for an absent `launcher` key — see
 /// [`read_launcher`]. `fuzzel` is the default app launcher this panel ships
 /// alongside; anyone running a different one overrides it with one line.
 pub const DEFAULT_LAUNCHER: &str = "fuzzel";
@@ -402,10 +453,10 @@ fn expand_tilde_with_home(path: &str, home: Option<std::ffi::OsString>) -> PathB
     PathBuf::from(path)
 }
 
-/// `colors { ink "#…"; paper "#…"; accent "#…" }` — the style guide's own
-/// three identity colors, each independently optional. `None` means "the
-/// built-in Saola value" (see [`ColorOverrides::apply`]), so a `colors { }`
-/// block that only mentions `accent` leaves `ink`/`paper` untouched.
+/// The `[colors]` table — the style guide's own three identity colors, each
+/// independently optional. `None` means "the built-in Saola value" (see
+/// [`ColorOverrides::apply`]), so a `[colors]` table that only mentions
+/// `accent` leaves `ink`/`paper` untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ColorOverrides {
     pub ink: Option<Color>,
@@ -415,7 +466,7 @@ pub struct ColorOverrides {
 
 impl ColorOverrides {
     /// Overwrites only the fields that were actually set — see the module
-    /// doc comment's "How `colors { }` reaches the theme" section for why
+    /// doc comment's "How `[colors]` reaches the theme" section for why
     /// this mutates `palette` in place rather than producing a new `Theme`.
     pub fn apply(&self, palette: &mut Palette) {
         if let Some(ink) = self.ink {
@@ -430,25 +481,25 @@ impl ColorOverrides {
     }
 }
 
-/// Builds a whole [`Theme`] from `colors { }` overrides: starts from the
-/// built-in palette, applies whichever fields `colors` set
+/// Builds a whole [`Theme`] from `[colors]` overrides: starts from the
+/// built-in palette, applies whichever fields `[colors]` set
 /// ([`ColorOverrides::apply`]), then hands the result to
 /// `Theme::with_palette` so the alpha-stepped `on_ink`/`on_paper` roles and
 /// every scrim are re-derived from the (possibly overridden) colors instead
 /// of staying pinned to the built-in ivory/ink — see the module doc
-/// comment's "How `colors { }` reaches the theme" section.
+/// comment's "How `[colors]` reaches the theme" section.
 ///
-/// With no overrides set, `colors` leaves `Palette::default()` untouched,
+/// With no overrides set, `[colors]` leaves `Palette::default()` untouched,
 /// and `Theme::with_palette(Palette::default())` is exactly `Theme::saola()`
-/// — so a stock config (no `colors { }` block at all) produces the same
-/// theme it always did.
+/// — so a stock config (no `[colors]` table at all) produces the same theme
+/// it always did.
 pub fn build_theme(colors: &ColorOverrides) -> Theme {
     let mut palette = Palette::default();
     colors.apply(&mut palette);
     Theme::with_palette(palette)
 }
 
-/// The whole of `panel.kdl`, resolved to typed values — loaded at boot
+/// The whole of `panel.toml`, resolved to typed values — loaded at boot
 /// (`PanelConfig::load`) and re-loaded live whenever the file changes on
 /// disk ([`Self::reload_from`], driven by the `config_watch` subscription;
 /// `main.rs`'s reload arm is what re-applies the result to the running
@@ -477,7 +528,7 @@ pub struct PanelConfig {
     /// Which command clicking the mark glyph runs (`modules::mark::Mark`'s
     /// click handler — see that module's doc comment). `Some(cmd)` is the
     /// command line to spawn (default [`DEFAULT_LAUNCHER`], `"fuzzel"`);
-    /// `None` is the `launcher "none"` directive, which disables the mark's
+    /// `None` is the `launcher = "none"` key, which disables the mark's
     /// click behavior entirely (it renders as the same bare, unclickable
     /// glyph the panel always drew before this knob existed). Resolved at
     /// parse time, same as `mark` above.
@@ -486,9 +537,9 @@ pub struct PanelConfig {
     /// [`ClaudeIcon`].
     pub claude_icon: ClaudeIcon,
     /// The focused-window-title module's own knobs — see
-    /// [`WindowTitleConfig`]. A *block* rather than two top-level directives
-    /// because that is the shape the style guide's own §10 sketch writes, and
-    /// because both knobs belong to one module.
+    /// [`WindowTitleConfig`]. A *table* rather than two top-level keys
+    /// because both knobs belong to one module, and because that is the
+    /// shape the style guide's own §10 sketch writes.
     pub window_title: WindowTitleConfig,
     pub colors: ColorOverrides,
 }
@@ -511,7 +562,7 @@ impl Default for PanelConfig {
     /// trailing end). Top edge, ledger style, the
     /// built-in horns mark
     /// clicking through to `fuzzel` ([`DEFAULT_LAUNCHER`]), no color
-    /// overrides. This is also what an absent `panel.kdl` produces, and
+    /// overrides. This is also what an absent `panel.toml` produces, and
     /// what a garbage one falls back to in full.
     fn default() -> Self {
         PanelConfig {
@@ -541,13 +592,13 @@ impl Default for PanelConfig {
     }
 }
 
-/// A KDL document that failed to parse at all — the "garbage file" case.
+/// A TOML document that failed to parse at all — the "garbage file" case.
 /// Deliberately the *only* error this module has: once the document parses,
 /// every remaining problem (a bad knob value, an unknown module) is handled
 /// knob-by-knob with a warning, never by returning `Err` — see the module
 /// doc comment.
 #[derive(Debug)]
-pub struct ConfigError(kdl::KdlError);
+pub struct ConfigError(toml::de::Error);
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -589,7 +640,7 @@ impl PanelConfig {
         })
     }
 
-    /// Where `panel.kdl` lives: the resolved config **directory** joined
+    /// Where `panel.toml` lives: the resolved config **directory** joined
     /// with the fixed file name. `main` calls this exactly once, at boot,
     /// and threads the result to both consumers — [`Self::load`] and the
     /// `config_watch` worker — so the loader and the watcher cannot end up
@@ -619,7 +670,7 @@ impl PanelConfig {
             std::env::var_os("XDG_CONFIG_HOME"),
             std::env::var_os("HOME"),
         )
-        .map(|dir| dir.join("panel.kdl"))
+        .map(|dir| dir.join("panel.toml"))
     }
 
     /// Load the config at boot, from the path [`Self::resolve_path`] gave
@@ -642,17 +693,23 @@ impl PanelConfig {
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
             // Covers both "the file doesn't exist" (the common case: nobody
-            // has written a panel.kdl yet) and any other I/O error (e.g.
+            // has written a panel.toml yet) and any other I/O error (e.g.
             // permissions) — both degrade to defaults silently. An I/O
-            // error here is not "malformed KDL", so it does not get the
-            // stderr warning that a parse failure does.
-            Err(_) => return Self::default(),
+            // error here is not "malformed TOML", so it does not get the
+            // stderr warning that a parse failure does. A missing file is
+            // also the one trigger for the migration hint: a leftover
+            // `panel.kdl` sitting where `panel.toml` should be is worth
+            // saying out loud once, at boot.
+            Err(_) => {
+                warn_if_stale_kdl_sibling(path);
+                return Self::default();
+            }
         };
         match Self::parse(&contents) {
             Ok(config) => config,
             Err(err) => {
                 eprintln!(
-                    "saola-panel: {} is not valid KDL ({err}) — using defaults",
+                    "saola-panel: {} is not valid TOML ({err}) — using defaults",
                     path.display()
                 );
                 Self::default()
@@ -665,12 +722,15 @@ impl PanelConfig {
     /// config the panel is already running".
     ///
     /// The resilience rules here deliberately differ from [`Self::load_from`]
-    /// in exactly one case, because the two run at different moments:
+    /// in exactly two ways, because the two run at different moments:
     ///
     /// - **File missing** → `Some(default)`. At boot that meant "nobody wrote
     ///   a config"; mid-session it means the user *deleted* it, and reverting
     ///   the running panel to defaults is what honoring that edit looks like.
-    /// - **File present but not valid KDL** → warn, then `None`. Boot has no
+    ///   No migration hint either: [`warn_if_stale_kdl_sibling`] is a
+    ///   once-at-boot nudge, and a watcher that fired it on every save would
+    ///   be noise.
+    /// - **File present but not valid TOML** → warn, then `None`. Boot has no
     ///   previous config to keep, so it falls back to defaults — but a live
     ///   panel does, and a half-saved edit (or a typo mid-editing-session)
     ///   flashing the whole bar back to the stock layout would punish the
@@ -688,7 +748,7 @@ impl PanelConfig {
             Ok(config) => Some(config),
             Err(err) => {
                 eprintln!(
-                    "saola-panel: {} is not valid KDL ({err}) — keeping the current config",
+                    "saola-panel: {} is not valid TOML ({err}) — keeping the current config",
                     path.display()
                 );
                 None
@@ -696,55 +756,53 @@ impl PanelConfig {
         }
     }
 
-    /// Parse a `panel.kdl` document's contents into a [`PanelConfig`].
+    /// Parse a `panel.toml` document's contents into a [`PanelConfig`].
     ///
-    /// Returns `Err` **only** if `contents` isn't valid KDL at all — every
-    /// other problem (a missing `panel { }` node, an absent knob, a bad
-    /// knob value, an unknown module name) is resolved to a default and
-    /// reported with `eprintln!` rather than failing the whole parse. This
-    /// is the function the unit tests below exercise directly, without
-    /// touching the filesystem.
+    /// Returns `Err` **only** if `contents` isn't valid TOML at all — every
+    /// other problem (an absent knob, a bad knob value, a list that isn't an
+    /// array, an unknown module name) is resolved to a default and reported
+    /// with `eprintln!` rather than failing the whole parse. This is the
+    /// function the unit tests below exercise directly, without touching the
+    /// filesystem.
     pub fn parse(contents: &str) -> Result<Self, ConfigError> {
-        let document = KdlDocument::parse(contents).map_err(ConfigError)?;
+        // No `[panel]` wrapper table (see the module doc comment): every
+        // knob is a bare top-level key, so `body` is the parsed top-level
+        // table itself — no `.get("panel")` indirection like the KDL
+        // version needed. An empty document parses to an empty table, so
+        // "no file", "empty file" and "file that sets nothing" all produce
+        // the identical result: `PanelConfig::default()`.
+        let body: Table = contents.parse().map_err(ConfigError)?;
 
-        // No top-level `panel { }` node at all is not "garbage" — it's a
-        // config file that doesn't configure the panel (an empty file is
-        // the trivial case of this, and `Theme::from_toml_str("")` treats
-        // an empty *theme* file the same permissive way). Every knob below
-        // is read through this `Option`, so "no panel node" and "panel node
-        // present but every knob absent" produce the identical result:
-        // `PanelConfig::default()`.
-        let body = document.get("panel").and_then(|node| node.children());
-
-        let style = read_arg_str(body, "style")
+        let style = read_str(&body, "style")
             .and_then(|value| match_or_warn(value, "style", parse_style))
             .unwrap_or_default();
 
-        let edge = read_arg_str(body, "edge")
+        let edge = read_str(&body, "edge")
             .and_then(|value| match_or_warn(value, "edge", parse_edge))
             .unwrap_or_default();
 
-        let margin = read_arg_number(body, "margin");
-        let height = read_arg_number(body, "height");
+        let margin = read_number(&body, "margin");
+        let height = read_number(&body, "height");
 
-        let left = read_module_list(body, "left").unwrap_or_else(|| PanelConfig::default().left);
+        let left = read_module_list(&body, "left").unwrap_or_else(|| PanelConfig::default().left);
         let center =
-            read_module_list(body, "center").unwrap_or_else(|| PanelConfig::default().center);
-        let right = read_module_list(body, "right").unwrap_or_else(|| PanelConfig::default().right);
+            read_module_list(&body, "center").unwrap_or_else(|| PanelConfig::default().center);
+        let right =
+            read_module_list(&body, "right").unwrap_or_else(|| PanelConfig::default().right);
 
-        let mark = read_arg_str(body, "mark")
+        let mark = read_str(&body, "mark")
             .and_then(|value| match_or_warn(value, "mark", MarkSource::parse))
             .unwrap_or_default();
 
-        let launcher = read_launcher(body);
+        let launcher = read_launcher(&body);
 
-        let claude_icon = read_arg_str(body, "claude-icon")
+        let claude_icon = read_str(&body, "claude-icon")
             .and_then(|value| match_or_warn(value, "claude-icon", ClaudeIcon::parse))
             .unwrap_or_default();
 
-        let window_title = read_window_title(body);
+        let window_title = read_window_title(&body);
 
-        let colors = read_colors(body);
+        let colors = read_colors(&body);
 
         Ok(PanelConfig {
             style,
@@ -763,6 +821,32 @@ impl PanelConfig {
     }
 }
 
+/// The migration hint for the KDL → TOML move (2026-09-07, the same shape
+/// saola-capture's loader has carried since its own migration): a
+/// `panel.toml` that doesn't exist yet is unremarkable on its own (the
+/// common "haven't configured anything" case), but if a **sibling
+/// `panel.kdl`** sits right next to where `panel.toml` would go, it is
+/// almost certainly a pre-migration config nobody has ported — worth one
+/// `eprintln!` naming both paths so the fix is obvious, without turning it
+/// into an error (defaults still apply exactly as they would for any other
+/// missing file).
+///
+/// Called from [`PanelConfig::load_from`] only: this is a once-at-boot
+/// nudge, not something the live-reload watcher should repeat on every save.
+fn warn_if_stale_kdl_sibling(toml_path: &Path) {
+    let kdl_path = toml_path.with_file_name("panel.kdl");
+    if kdl_path.is_file() {
+        eprintln!(
+            "saola-panel: found {} but no {} — panel.kdl is no longer read (the panel's \
+             config moved to TOML); copy its knobs into {} using the same names, or \
+             delete it to stop seeing this hint — using defaults for now",
+            kdl_path.display(),
+            toml_path.display(),
+            toml_path.display()
+        );
+    }
+}
+
 /// The `--help` text, kept next to [`CliOverrides::parse`] so the two lists
 /// of flags can't drift apart without the mismatch staring the editor in the
 /// face (and a test cross-checks them). `main` prints this and exits before
@@ -772,14 +856,14 @@ saola-panel — status bar for the Saola desktop environment
 
 Usage: saola-panel [FLAGS]
 
-Flags override the matching knobs in panel.kdl; anything not flagged
+Flags override the matching knobs in panel.toml; anything not flagged
 comes from the file (or the built-in default when there is no file).
 
   --ledger             ledger layout: one full-width bar
   --islands            islands layout: floating ink pill clusters
   --top                anchor the panel to the top edge of the screen
   --bottom             anchor the panel to the bottom edge
-  --config-dir <dir>   read panel.kdl from <dir> instead of the
+  --config-dir <dir>   read panel.toml from <dir> instead of the
                        $SAOLA_CONFIG_DIR / XDG search path
                        (also spelled --config-dir=<dir>)
   -h, --help           print this help and exit
@@ -787,7 +871,7 @@ comes from the file (or the built-in default when there is no file).
 
 /// Command-line overrides for quick testing: `--ledger`, `--islands`,
 /// `--top`, `--bottom`, `--config-dir <dir>`, plus `--help`. A flag beats the
-/// corresponding `panel.kdl` knob, which beats the built-in default — so
+/// corresponding `panel.toml` knob, which beats the built-in default — so
 /// `cargo run -- --islands` tries the Islands layout without editing (or
 /// even having) a config file, and the next plain `cargo run` is back to
 /// whatever the file says.
@@ -796,17 +880,17 @@ comes from the file (or the built-in default when there is no file).
 /// flag wasn't given, leave the config value alone". Only the two
 /// mode-switch knobs and the config location are exposed — flags are a
 /// testing convenience, not a second config surface; anything richer
-/// belongs in `panel.kdl`.
+/// belongs in `panel.toml`.
 ///
 /// (Historical note: Stage 14 removed the original v0.1 `--bottom` flag in
-/// favor of `edge "bottom"` in the config file. This brings it back with
+/// favor of `edge = "bottom"` in the config file. This brings it back with
 /// different semantics — an *override on top of* the file rather than the
 /// only knob there is.)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CliOverrides {
     pub style: Option<PanelStyle>,
     pub edge: Option<Edge>,
-    /// `--config-dir <dir>` (or `--config-dir=<dir>`): read `panel.kdl`
+    /// `--config-dir <dir>` (or `--config-dir=<dir>`): read `panel.toml`
     /// from this directory instead of the `$SAOLA_CONFIG_DIR`/XDG chain —
     /// the head of [`PanelConfig::resolve_path`]'s precedence list. Unlike
     /// `style`/`edge` above, this one is **not** applied by [`Self::apply`]
@@ -836,7 +920,7 @@ impl CliOverrides {
     ///
     /// Resilience matches the config file's rules: an unrecognized argument
     /// warns on stderr and is ignored — a typo on the command line must
-    /// never kill the bar, same as a typo'd knob in `panel.kdl` doesn't.
+    /// never kill the bar, same as a typo'd knob in `panel.toml` doesn't.
     /// If contradictory flags are given (`--ledger --islands`), the last
     /// one wins, like shadowing a shell variable.
     ///
@@ -945,54 +1029,74 @@ fn parse_edge(value: &str) -> Option<Edge> {
 fn match_or_warn<T>(value: &str, knob: &str, parser: fn(&str) -> Option<T>) -> Option<T> {
     let parsed = parser(value);
     if parsed.is_none() {
-        eprintln!("saola-panel: panel.kdl: unrecognized {knob} \"{value}\" — using default");
+        eprintln!("saola-panel: panel.toml: unrecognized {knob} \"{value}\" — using default");
     }
     parsed
 }
 
-/// `body.get_arg(name)` as a string, if the node exists and its first
-/// positional argument is a KDL string. A node present but holding a
-/// non-string value (`margin "twenty"` for a numeric knob's cousin, say)
-/// falls through to `None` — same "absent knob" fallback path, no separate
-/// error needed for "wrong value type" versus "missing entirely".
-fn read_arg_str<'a>(body: Option<&'a KdlDocument>, name: &str) -> Option<&'a str> {
-    body?.get_arg(name)?.as_string()
+/// `table.get(name)` as a string, if the key exists and its value is a TOML
+/// string. A key present but holding a non-string value (`style = 3`, say)
+/// falls through to `None` — the same "absent knob" fallback path, no
+/// separate error needed for "wrong value type" versus "missing entirely".
+fn read_str<'a>(table: &'a Table, name: &str) -> Option<&'a str> {
+    table.get(name)?.as_str()
 }
 
-/// `body.get_arg(name)` as an `f32`, accepting either KDL integers
-/// (`margin 26`) or floats (`margin 26.0`) — the style guide's own example
-/// uses bare integers, but nothing about the knob's meaning requires one.
-fn read_arg_number(body: Option<&KdlDocument>, name: &str) -> Option<f32> {
-    let value = body?.get_arg(name)?;
-    number_as_f32(value)
+/// `table.get(name)` as an `f32`, accepting either TOML integers
+/// (`margin = 26`) or floats (`margin = 26.0`) — the style guide's own
+/// example uses bare integers, but nothing about the knob's meaning
+/// requires one. Anything else (a string, a boolean, an array) warns and
+/// defaults, the same per-knob rule every other bad value gets.
+fn read_number(table: &Table, name: &str) -> Option<f32> {
+    let value = table.get(name)?;
+    match number_as_f32(value) {
+        Some(number) => Some(number),
+        None => {
+            eprintln!("saola-panel: panel.toml: {name} {value} is not a number — using default");
+            None
+        }
+    }
 }
 
-fn number_as_f32(value: &KdlValue) -> Option<f32> {
+fn number_as_f32(value: &Value) -> Option<f32> {
     if let Some(i) = value.as_integer() {
         return Some(i as f32);
     }
     value.as_float().map(|f| f as f32)
 }
 
-/// Reads a `left { mark; mpris }`-shaped block: a child node named `list_name`
-/// whose own children are bare module-name nodes. `None` means the block
-/// itself is absent (caller substitutes the default list for that region);
-/// `Some(vec)` is returned even if every name inside turned out to be
-/// unknown (an empty list is a legitimate "nothing in this region" choice,
-/// not a signal to fall back to defaults — the two are different requests).
-fn read_module_list(body: Option<&KdlDocument>, list_name: &str) -> Option<Vec<ModuleName>> {
-    let list_node = body?.get(list_name)?;
-    let list_body = list_node.children()?;
-    let modules = list_body
-        .nodes()
+/// Reads a `left = ["mark", "mpris"]`-shaped key: an array of module-name
+/// strings. `None` means the caller should substitute that region's default
+/// list, and covers two cases — the key is absent, or its value isn't an
+/// array at all (a typo like `left = "mark"`, which warns). `Some(vec)` is
+/// returned even if every name inside turned out to be unknown: an empty
+/// list is a legitimate "nothing in this region" choice, not a signal to
+/// fall back to defaults — the two are different requests.
+fn read_module_list(table: &Table, list_name: &str) -> Option<Vec<ModuleName>> {
+    let value = table.get(list_name)?;
+    let Some(entries) = value.as_array() else {
+        eprintln!(
+            "saola-panel: panel.toml: {list_name} {value} is not an array of module names — using the default list"
+        );
+        return None;
+    };
+    let modules = entries
         .iter()
-        .filter_map(|node| {
-            let name = node.name().value();
+        .filter_map(|entry| {
+            // A non-string entry (`left = ["mark", 3]`) gets the same
+            // treatment as an unrecognized name: warn about that one entry
+            // and skip it, leaving the rest of the array intact.
+            let Some(name) = entry.as_str() else {
+                eprintln!(
+                    "saola-panel: panel.toml: {entry} in {list_name} is not a module name — skipped"
+                );
+                return None;
+            };
             match ModuleName::parse(name) {
                 Some(module) => Some(module),
                 None => {
                     eprintln!(
-                        "saola-panel: panel.kdl: unknown module \"{name}\" in {list_name} — skipped"
+                        "saola-panel: panel.toml: unknown module \"{name}\" in {list_name} — skipped"
                     );
                     None
                 }
@@ -1002,44 +1106,59 @@ fn read_module_list(body: Option<&KdlDocument>, list_name: &str) -> Option<Vec<M
     Some(modules)
 }
 
-/// Reads the top-level `launcher "…"` directive. Unlike `mark` (a closed set
+/// `table.get(name)` as a nested table — the `[window-title]`/`[colors]`
+/// blocks. `None` is both "the block is absent" and "the key exists but
+/// isn't a table" (`colors = "terracotta"`, say); the second warns once and
+/// the whole block falls back to its defaults, rather than the parse
+/// failing.
+fn read_block<'a>(table: &'a Table, name: &str) -> Option<&'a Table> {
+    let value = table.get(name)?;
+    match value.as_table() {
+        Some(block) => Some(block),
+        None => {
+            eprintln!(
+                "saola-panel: panel.toml: [{name}] {value} is not a table — using defaults for that block"
+            );
+            None
+        }
+    }
+}
+
+/// Reads the top-level `launcher = "…"` key. Unlike `mark` (a closed set
 /// of prefixes matched against `MarkSource::parse`) or `style`/`edge` (a
 /// closed set of named values), a launcher is a free-form shell command
 /// line — almost any string is "valid" here, there's no typo to warn about,
 /// so this has no `match_or_warn` step. Only one string is special-cased:
 /// the literal `"none"`, which disables the mark's click behavior rather
 /// than being passed to `std::process::Command` as a (nonsensical) program
-/// name. An absent directive resolves to [`DEFAULT_LAUNCHER`] — the mark is
+/// name. An absent key resolves to [`DEFAULT_LAUNCHER`] — the mark is
 /// clickable out of the box, matching the style guide's "bare-icon menu"
 /// being a real menu trigger, not a decoration.
-fn read_launcher(body: Option<&KdlDocument>) -> Option<String> {
-    match read_arg_str(body, "launcher") {
+fn read_launcher(table: &Table) -> Option<String> {
+    match read_str(table, "launcher") {
         None => Some(DEFAULT_LAUNCHER.to_string()),
         Some("none") => None,
         Some(command) => Some(command.to_string()),
     }
 }
 
-/// Reads `window-title { max-chars 50; overflow "truncate" }` — the style
-/// guide §10 sketch's own block, verbatim.
+/// Reads the `[window-title]` table (`max-chars = 50`,
+/// `overflow = "truncate"`) — the style guide §10 sketch's own block.
 ///
-/// Same knob-by-knob resilience as `colors { }` just below: an absent block,
-/// a block that only sets one of the two, a nonsense `overflow`, or a
+/// Same knob-by-knob resilience as `[colors]` just below: an absent block, a
+/// block that only sets one of the two, a nonsense `overflow`, or a
 /// `max-chars` that isn't a positive integer each fall back to that one
 /// knob's default (warning where there is a typo to warn about) rather than
 /// discarding the block.
-fn read_window_title(body: Option<&KdlDocument>) -> WindowTitleConfig {
-    let Some(block) = body
-        .and_then(|d| d.get("window-title"))
-        .and_then(|n| n.children())
-    else {
-        return WindowTitleConfig::default();
+fn read_window_title(table: &Table) -> WindowTitleConfig {
+    let defaults = WindowTitleConfig::default();
+    let Some(block) = read_block(table, "window-title") else {
+        return defaults;
     };
 
-    let defaults = WindowTitleConfig::default();
     WindowTitleConfig {
         max_chars: read_max_chars(block).unwrap_or(defaults.max_chars),
-        overflow: read_arg_str(Some(block), "overflow")
+        overflow: read_str(block, "overflow")
             .and_then(|value| match_or_warn(value, "window-title overflow", TitleOverflow::parse))
             .unwrap_or(defaults.overflow),
     }
@@ -1047,43 +1166,42 @@ fn read_window_title(body: Option<&KdlDocument>) -> WindowTitleConfig {
 
 /// `max-chars` as a positive count. Unlike `margin`/`height` (which accept
 /// floats, since a logical pixel can sensibly be fractional) this is a count
-/// of characters, so only KDL integers qualify — and only positive ones: a
-/// `max-chars 0` would render every title as a bare `…`, and a negative one
-/// means nothing at all. Both warn and default, the same per-knob rule every
+/// of characters, so only TOML integers qualify — and only positive ones: a
+/// `max-chars = 0` would render every title as a bare `…`, and a negative
+/// one means nothing. Both warn and default, the same per-knob rule every
 /// other bad value gets.
-fn read_max_chars(block: &KdlDocument) -> Option<usize> {
-    let value = block.get_arg("max-chars")?;
+fn read_max_chars(block: &Table) -> Option<usize> {
+    let value = block.get("max-chars")?;
     match value.as_integer() {
-        // `i128` → `usize`: the guard is what makes the conversion sound
-        // (positive, and no larger than a title could ever be). Anything
-        // absurd is clamped rather than rejected — a `max-chars` of a billion
-        // is a strange config, not a broken one, and it simply never cuts.
-        Some(count) if count > 0 => Some(count.min(usize::MAX as i128) as usize),
+        // `i64` → `usize`: the guard is what makes the conversion sound
+        // (positive), and `try_from` is what makes it *portable* — on a
+        // 32-bit target an `i64` can legitimately exceed `usize::MAX`, so an
+        // absurd value is clamped rather than rejected. A `max-chars` of a
+        // billion is a strange config, not a broken one, and it simply
+        // never cuts.
+        Some(count) if count > 0 => Some(usize::try_from(count).unwrap_or(usize::MAX)),
         _ => {
             eprintln!(
-                "saola-panel: panel.kdl: window-title max-chars {value} is not a positive integer — using default"
+                "saola-panel: panel.toml: window-title max-chars {value} is not a positive integer — using default"
             );
             None
         }
     }
 }
 
-/// Reads `colors { ink "#…"; paper "#…"; accent "#…" }`. Each of the three
-/// is independently optional — both "the whole `colors { }` block is
-/// absent" and "the block exists but only sets `accent`" leave the other
-/// fields `None`, which `ColorOverrides::apply` treats as "keep the
-/// built-in value".
-fn read_colors(body: Option<&KdlDocument>) -> ColorOverrides {
-    let Some(colors_body) = body
-        .and_then(|d| d.get("colors"))
-        .and_then(|n| n.children())
-    else {
+/// Reads the `[colors]` table (`ink = "#…"`, `paper = "#…"`,
+/// `accent = "#…"`). Each of the three is independently optional — both
+/// "the whole `[colors]` table is absent" and "the table exists but only
+/// sets `accent`" leave the other fields `None`, which
+/// `ColorOverrides::apply` treats as "keep the built-in value".
+fn read_colors(table: &Table) -> ColorOverrides {
+    let Some(colors) = read_block(table, "colors") else {
         return ColorOverrides::default();
     };
     ColorOverrides {
-        ink: read_arg_str(Some(colors_body), "ink").and_then(|v| parse_color("ink", v)),
-        paper: read_arg_str(Some(colors_body), "paper").and_then(|v| parse_color("paper", v)),
-        accent: read_arg_str(Some(colors_body), "accent").and_then(|v| parse_color("accent", v)),
+        ink: read_str(colors, "ink").and_then(|v| parse_color("ink", v)),
+        paper: read_str(colors, "paper").and_then(|v| parse_color("paper", v)),
+        accent: read_str(colors, "accent").and_then(|v| parse_color("accent", v)),
     }
 }
 
@@ -1092,7 +1210,7 @@ fn parse_color(field: &str, value: &str) -> Option<Color> {
         Ok(color) => Some(color),
         Err(err) => {
             eprintln!(
-                "saola-panel: panel.kdl: colors.{field} \"{value}\" is not a valid color ({err}) — using default"
+                "saola-panel: panel.toml: colors.{field} \"{value}\" is not a valid color ({err}) — using default"
             );
             None
         }
@@ -1109,35 +1227,50 @@ mod tests {
     /// today's hardcoded layout.
     #[test]
     fn default_config_parses() {
-        let config = PanelConfig::parse("").expect("an empty document is valid KDL");
+        let config = PanelConfig::parse("").expect("an empty document is valid TOML");
         assert_eq!(config, PanelConfig::default());
     }
 
-    /// Every knob the style guide's `panel { }` sketch shows, set to
-    /// non-default values, all land correctly.
+    /// The shipped `examples/panel.toml` is documentation that has to parse:
+    /// it is compiled in with `include_str!` and asserted to be exactly the
+    /// built-in defaults, which is what its own header promises a reader.
+    /// A knob renamed here without the example following it fails this test
+    /// rather than shipping a file that warns on every boot.
+    #[test]
+    fn the_shipped_example_parses_to_the_defaults() {
+        let example = include_str!("../examples/panel.toml");
+        let config = PanelConfig::parse(example).expect("the shipped example must be valid TOML");
+        assert_eq!(config, PanelConfig::default());
+    }
+
+    /// Every knob the style guide's panel sketch shows, set to non-default
+    /// values, all lands correctly.
     #[test]
     fn full_config_parses() {
-        let kdl = r##"
-            panel {
-                style "islands"
-                edge "bottom"
-                margin 26
-                height 40
+        let toml = r##"
+            style = "islands"
+            edge = "bottom"
+            margin = 26
+            height = 40
 
-                left   { mark; window-title; mpris }
-                center { clock; niri-columns }
-                right  { volume; network; bluetooth; battery; claude; antigravity; tray }
+            left   = ["mark", "window-title", "mpris"]
+            center = ["clock", "niri-columns"]
+            right  = ["volume", "network", "bluetooth", "battery", "claude", "antigravity", "tray"]
 
-                mark "builtin:notch"
-                launcher "wofi --show drun"
-                claude-icon "claude-code"
+            mark = "builtin:notch"
+            launcher = "wofi --show drun"
+            claude-icon = "claude-code"
 
-                window-title { max-chars 24; overflow "marquee" }
+            [window-title]
+            max-chars = 24
+            overflow = "marquee"
 
-                colors { ink "#111111"; paper "#EEEEEE"; accent "#FF8800" }
-            }
+            [colors]
+            ink = "#111111"
+            paper = "#EEEEEE"
+            accent = "#FF8800"
         "##;
-        let config = PanelConfig::parse(kdl).expect("well-formed KDL");
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
 
         assert_eq!(config.style, PanelStyle::Islands);
         assert_eq!(config.edge, Edge::Bottom);
@@ -1188,13 +1321,13 @@ mod tests {
     /// disables all defaults".
     #[test]
     fn partial_config_parses() {
-        let kdl = r##"
-            panel {
-                edge "bottom"
-                colors { accent "#00FF00" }
-            }
+        let toml = r##"
+            edge = "bottom"
+
+            [colors]
+            accent = "#00FF00"
         "##;
-        let config = PanelConfig::parse(kdl).expect("well-formed KDL");
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
 
         assert_eq!(config.edge, Edge::Bottom);
         assert_eq!(
@@ -1214,12 +1347,12 @@ mod tests {
         assert_eq!(config.colors.paper, None);
     }
 
-    /// Syntactically invalid KDL is the one case `parse` itself rejects —
+    /// Syntactically invalid TOML is the one case `parse` itself rejects —
     /// `load_from` (not exercised here, since it touches the filesystem) is
     /// what turns this `Err` into a full-default fallback plus a warning.
     #[test]
     fn garbage_is_rejected_by_parse() {
-        let result = PanelConfig::parse("panel { this is not } valid kdl {{{");
+        let result = PanelConfig::parse("this is not = = valid toml [[[");
         assert!(result.is_err());
     }
 
@@ -1230,10 +1363,10 @@ mod tests {
     fn garbage_file_falls_back_to_defaults() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "saola-panel-test-garbage-{}.kdl",
+            "saola-panel-test-garbage-{}.toml",
             std::process::id()
         ));
-        std::fs::write(&path, "panel { this is not } valid kdl {{{").unwrap();
+        std::fs::write(&path, "this is not = = valid toml [[[").unwrap();
 
         let config = PanelConfig::load_from(&path);
 
@@ -1250,15 +1383,15 @@ mod tests {
     fn reload_keeps_the_running_config_on_a_malformed_file() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "saola-panel-test-reload-{}.kdl",
+            "saola-panel-test-reload-{}.toml",
             std::process::id()
         ));
 
-        std::fs::write(&path, r#"panel { edge "bottom" }"#).unwrap();
+        std::fs::write(&path, r#"edge = "bottom""#).unwrap();
         let reloaded = PanelConfig::reload_from(&path).expect("a valid file must load");
         assert_eq!(reloaded.edge, Edge::Bottom);
 
-        std::fs::write(&path, "panel { this is not } valid kdl {{{").unwrap();
+        std::fs::write(&path, "this is not = = valid toml [[[").unwrap();
         assert_eq!(
             PanelConfig::reload_from(&path),
             None,
@@ -1278,7 +1411,7 @@ mod tests {
     /// thing is that this does not panic and does not fail the parse).
     #[test]
     fn missing_file_falls_back_to_defaults() {
-        let path = std::env::temp_dir().join("saola-panel-test-definitely-missing.kdl");
+        let path = std::env::temp_dir().join("saola-panel-test-definitely-missing.toml");
         std::fs::remove_file(&path).ok();
 
         let config = PanelConfig::load_from(&path);
@@ -1286,16 +1419,43 @@ mod tests {
         assert_eq!(config, PanelConfig::default());
     }
 
+    /// A missing `panel.toml` with a stale `panel.kdl` beside it still
+    /// resolves to defaults — the migration hint is a warning, not an error,
+    /// and must not change what the panel starts with. The pair lives in a
+    /// temp directory of this test's own (a process-id'd name, so parallel
+    /// test threads and concurrent `cargo test` runs never share it) with
+    /// the *real* fixed file names, which is what makes this exercise
+    /// [`warn_if_stale_kdl_sibling`]'s actual `with_file_name("panel.kdl")`
+    /// lookup rather than a stand-in for it.
+    #[test]
+    fn missing_toml_with_a_stale_kdl_sibling_still_falls_back_to_defaults() {
+        let dir =
+            std::env::temp_dir().join(format!("saola-panel-test-migration-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let toml_path = dir.join("panel.toml");
+        let kdl_path = dir.join("panel.kdl");
+        std::fs::remove_file(&toml_path).ok();
+        std::fs::write(&kdl_path, "panel { edge \"bottom\" }").unwrap();
+
+        let config = PanelConfig::load_from(&toml_path);
+
+        std::fs::remove_file(&kdl_path).ok();
+        std::fs::remove_dir(&dir).ok();
+        assert_eq!(
+            config,
+            PanelConfig::default(),
+            "a leftover panel.kdl is a hint, never a config source"
+        );
+    }
+
     /// An unknown module name in a list is skipped, but its known
     /// neighbors still load — the list-level resilience rule.
     #[test]
     fn unknown_module_is_skipped_with_the_rest_of_the_list_intact() {
-        let kdl = r##"
-            panel {
-                right { volume; weather; battery }
-            }
+        let toml = r##"
+            right = ["volume", "weather", "battery"]
         "##;
-        let config = PanelConfig::parse(kdl).expect("well-formed KDL");
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
 
         assert_eq!(
             config.right,
@@ -1304,16 +1464,75 @@ mod tests {
         );
     }
 
+    /// A list knob that isn't an array at all (`left = "mark"`, the
+    /// commonest TOML typo for this schema) warns and leaves that region at
+    /// its default — it must not read as an empty region, and it must not
+    /// disturb the sibling regions.
+    #[test]
+    fn a_non_array_module_list_keeps_the_default_list() {
+        let toml = r##"
+            left = "mark"
+            right = ["battery"]
+        "##;
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
+
+        assert_eq!(
+            config.left,
+            PanelConfig::default().left,
+            "a non-array list is a typo, not an empty region"
+        );
+        assert_eq!(
+            config.right,
+            vec![ModuleName::Battery],
+            "the sibling region still loads"
+        );
+    }
+
+    /// A non-string entry inside an otherwise fine array is skipped exactly
+    /// like an unknown name — one bad entry, not a discarded list.
+    #[test]
+    fn a_non_string_list_entry_is_skipped_like_an_unknown_name() {
+        let toml = r##"
+            center = ["clock", 3, "niri-columns"]
+        "##;
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
+
+        assert_eq!(
+            config.center,
+            vec![ModuleName::Clock, ModuleName::NiriColumns],
+            "the integer entry should be dropped, not the whole list"
+        );
+    }
+
+    /// A `[window-title]` or `[colors]` key that holds something other than
+    /// a table warns once and falls back to that block's defaults, without
+    /// taking the rest of the document down.
+    #[test]
+    fn a_block_that_is_not_a_table_falls_back_to_its_defaults() {
+        let toml = r##"
+            edge = "bottom"
+            window-title = 5
+            colors = "terracotta"
+        "##;
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
+
+        assert_eq!(config.window_title, WindowTitleConfig::default());
+        assert_eq!(config.colors, ColorOverrides::default());
+        assert_eq!(
+            config.edge,
+            Edge::Bottom,
+            "a mistyped block must not blank the knobs around it"
+        );
+    }
+
     /// An empty list is a real answer ("nothing in this region"), distinct
     /// from an absent list ("use the default region").
     #[test]
     fn an_explicitly_empty_list_stays_empty() {
-        let kdl = r##"
-            panel {
-                left { }
-            }
+        let toml = r##"
+            left = []
         "##;
-        let config = PanelConfig::parse(kdl).expect("well-formed KDL");
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
         assert_eq!(config.left, Vec::new());
         // The un-mentioned regions still default.
         assert_eq!(config.right, PanelConfig::default().right);
@@ -1321,7 +1540,7 @@ mod tests {
 
     /// The name → variant mapping that module lists compose regions from —
     /// this is the pure core `main.rs`'s per-region `row(...)` calls rely
-    /// on to turn a `panel.kdl` list into the actual bar layout.
+    /// on to turn a `panel.toml` array into the actual bar layout.
     #[test]
     fn module_list_maps_names_to_module_name_variants() {
         assert_eq!(ModuleName::parse("mark"), Some(ModuleName::Mark));
@@ -1351,7 +1570,7 @@ mod tests {
         );
         // Every name in the style guide's own sketch now maps to a real
         // module, so the `None` arm's job is typos and names from a newer
-        // `panel.kdl` than this build.
+        // `panel.toml` than this build.
         assert_eq!(ModuleName::parse("weather"), None);
         assert_eq!(ModuleName::parse("not-a-real-module"), None);
     }
@@ -1377,7 +1596,7 @@ mod tests {
 
     /// `claude-icon`'s two wire forms, plus the resilience paths: absent →
     /// the Anthropic default, and an unrecognized value → warned and
-    /// defaulted, same per-knob rule as every other closed-set directive.
+    /// defaulted, same per-knob rule as every other closed-set key.
     #[test]
     fn claude_icon_parses_both_forms_and_defaults_on_nonsense() {
         assert_eq!(ClaudeIcon::parse("anthropic"), Some(ClaudeIcon::Anthropic));
@@ -1387,51 +1606,51 @@ mod tests {
         );
         assert_eq!(ClaudeIcon::parse("sparkle"), None);
 
-        let absent = PanelConfig::parse("panel {}").expect("well-formed KDL");
+        let absent = PanelConfig::parse("").expect("well-formed TOML");
         assert_eq!(absent.claude_icon, ClaudeIcon::Anthropic);
 
-        let typo = PanelConfig::parse(r#"panel { claude-icon "clod" }"#).expect("well-formed KDL");
+        let typo = PanelConfig::parse(r#"claude-icon = "clod""#).expect("well-formed TOML");
         assert_eq!(typo.claude_icon, ClaudeIcon::Anthropic);
     }
 
     /// `launcher`'s three shapes: absent → `DEFAULT_LAUNCHER`, `"none"` →
     /// disabled, anything else → passed through verbatim as the command
     /// line. Unlike `mark_source_parses_all_four_forms`, there is no
-    /// "unrecognized value" case to test — a launcher directive is a
-    /// free-form command line, not a closed set of named values.
+    /// "unrecognized value" case to test — a launcher is a free-form command
+    /// line, not a closed set of named values.
     #[test]
     fn launcher_directive_parses_all_three_forms() {
-        let absent = PanelConfig::parse("panel {}").expect("well-formed KDL");
+        let absent = PanelConfig::parse("").expect("well-formed TOML");
         assert_eq!(absent.launcher, Some(DEFAULT_LAUNCHER.to_string()));
 
-        let disabled = PanelConfig::parse(r#"panel { launcher "none" }"#).expect("well-formed KDL");
+        let disabled = PanelConfig::parse(r#"launcher = "none""#).expect("well-formed TOML");
         assert_eq!(disabled.launcher, None);
 
-        let custom = PanelConfig::parse(r#"panel { launcher "wofi --show drun" }"#)
-            .expect("well-formed KDL");
+        let custom =
+            PanelConfig::parse(r#"launcher = "wofi --show drun""#).expect("well-formed TOML");
         assert_eq!(custom.launcher, Some("wofi --show drun".to_string()));
     }
 
-    /// `window-title { }`'s two knobs, each independently optional — and an
+    /// `[window-title]`'s two knobs, each independently optional — and an
     /// absent block is exactly the same as an empty one, per the style
     /// guide's defaults (50 characters, truncate).
     #[test]
     fn window_title_block_parses_both_knobs_independently() {
-        let absent = PanelConfig::parse("panel {}").expect("well-formed KDL");
+        let absent = PanelConfig::parse("").expect("well-formed TOML");
         assert_eq!(absent.window_title, WindowTitleConfig::default());
         assert_eq!(absent.window_title.max_chars, DEFAULT_TITLE_MAX_CHARS);
         assert_eq!(absent.window_title.overflow, TitleOverflow::Truncate);
 
-        let empty = PanelConfig::parse("panel { window-title { } }").expect("well-formed KDL");
+        let empty = PanelConfig::parse("[window-title]").expect("well-formed TOML");
         assert_eq!(empty.window_title, WindowTitleConfig::default());
 
         let only_chars =
-            PanelConfig::parse("panel { window-title { max-chars 12 } }").expect("well-formed KDL");
+            PanelConfig::parse("[window-title]\nmax-chars = 12").expect("well-formed TOML");
         assert_eq!(only_chars.window_title.max_chars, 12);
         assert_eq!(only_chars.window_title.overflow, TitleOverflow::Truncate);
 
-        let only_overflow = PanelConfig::parse(r#"panel { window-title { overflow "marquee" } }"#)
-            .expect("well-formed KDL");
+        let only_overflow =
+            PanelConfig::parse("[window-title]\noverflow = \"marquee\"").expect("well-formed TOML");
         assert_eq!(
             only_overflow.window_title.max_chars,
             DEFAULT_TITLE_MAX_CHARS
@@ -1454,8 +1673,8 @@ mod tests {
         );
         assert_eq!(TitleOverflow::parse("scroll"), None);
 
-        let typo = PanelConfig::parse(r#"panel { window-title { overflow "scroll" } }"#)
-            .expect("well-formed KDL");
+        let typo =
+            PanelConfig::parse("[window-title]\noverflow = \"scroll\"").expect("well-formed TOML");
         assert_eq!(typo.window_title.overflow, TitleOverflow::Truncate);
     }
 
@@ -1464,9 +1683,8 @@ mod tests {
     #[test]
     fn a_nonsense_max_chars_falls_back_without_taking_the_block_down() {
         for bad in ["0", "-5", "\"fifty\"", "12.5"] {
-            let kdl =
-                format!(r#"panel {{ window-title {{ max-chars {bad}; overflow "marquee" }} }}"#);
-            let config = PanelConfig::parse(&kdl).expect("well-formed KDL");
+            let toml = format!("[window-title]\nmax-chars = {bad}\noverflow = \"marquee\"");
+            let config = PanelConfig::parse(&toml).expect("well-formed TOML");
             assert_eq!(
                 config.window_title.max_chars, DEFAULT_TITLE_MAX_CHARS,
                 "max-chars {bad} should have defaulted"
@@ -1525,7 +1743,22 @@ mod tests {
         assert_eq!(config.margin(&theme), 12.0);
     }
 
-    /// `colors { }` overrides exactly the fields it sets, and only after
+    /// `margin`/`height` take a TOML integer or float, and anything else
+    /// warns and defaults to the theme token — the per-knob rule applied to
+    /// the two numeric knobs.
+    #[test]
+    fn margin_and_height_accept_integers_and_floats_only() {
+        let numbers = PanelConfig::parse("margin = 26\nheight = 40.5").expect("well-formed TOML");
+        assert_eq!(numbers.margin, Some(26.0));
+        assert_eq!(numbers.height, Some(40.5));
+
+        let nonsense =
+            PanelConfig::parse("margin = \"twenty\"\nheight = true").expect("well-formed TOML");
+        assert_eq!(nonsense.margin, None);
+        assert_eq!(nonsense.height, None);
+    }
+
+    /// `[colors]` overrides exactly the fields it sets, and only after
     /// `apply` is called — proving the mutation shape `main.rs` relies on.
     #[test]
     fn color_overrides_apply_only_the_set_fields() {
@@ -1547,7 +1780,7 @@ mod tests {
         assert_eq!(palette.accent, Color::parse_hex("#abcdef").unwrap());
     }
 
-    /// No `colors { }` overrides at all must build the exact same theme as
+    /// No `[colors]` overrides at all must build the exact same theme as
     /// `Theme::saola()` — proves `build_theme` doesn't accidentally perturb
     /// the stock theme just by routing it through `with_palette`.
     #[test]
@@ -1574,16 +1807,16 @@ mod tests {
         assert_ne!(theme.on_paper, stock.on_paper);
     }
 
-    /// A bad color string in `colors { }` warns and leaves that one field
+    /// A bad color string in `[colors]` warns and leaves that one field
     /// `None` (default), without touching the rest of the parse.
     #[test]
     fn invalid_color_falls_back_to_none_for_that_field_only() {
-        let kdl = r##"
-            panel {
-                colors { ink "not-a-color"; accent "#C67139" }
-            }
+        let toml = r##"
+            [colors]
+            ink = "not-a-color"
+            accent = "#C67139"
         "##;
-        let config = PanelConfig::parse(kdl).expect("well-formed KDL");
+        let config = PanelConfig::parse(toml).expect("well-formed TOML");
         assert_eq!(config.colors.ink, None);
         assert_eq!(
             config.colors.accent,
@@ -1651,6 +1884,10 @@ mod tests {
         ] {
             assert!(HELP.contains(flag), "HELP is missing {flag}");
         }
+        assert!(
+            HELP.contains("panel.toml"),
+            "HELP must name the config file the flags override"
+        );
     }
 
     /// Contradictory flags don't error — the last one wins, like shadowing
@@ -1720,7 +1957,7 @@ mod tests {
         assert_eq!(
             CliOverrides::parse(["--config-dir", ""]).config_dir,
             None,
-            "an empty value must not resolve to a cwd-relative panel.kdl"
+            "an empty value must not resolve to a cwd-relative panel.toml"
         );
     }
 
@@ -1780,8 +2017,8 @@ mod tests {
     /// flag beats the file's value when both name the same knob.
     #[test]
     fn cli_apply_only_touches_set_fields() {
-        let kdl = r#"panel { style "islands"; edge "top" }"#;
-        let mut config = PanelConfig::parse(kdl).expect("well-formed KDL");
+        let toml = "style = \"islands\"\nedge = \"top\"";
+        let mut config = PanelConfig::parse(toml).expect("well-formed TOML");
 
         CliOverrides::parse(["--bottom"]).apply(&mut config);
         assert_eq!(config.style, PanelStyle::Islands, "file value kept");

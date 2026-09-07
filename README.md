@@ -7,7 +7,7 @@ defined; this panel hardcodes no color or size of its own.
 
 Two layout styles, one renderer: **ledger** (one floating ink pill, left / center /
 right) and **islands** (three separate translucent pill clusters floating over the
-wallpaper). Both read the same `panel.kdl` module lists and compose the same per-module
+wallpaper). Both read the same `panel.toml` module lists and compose the same per-module
 views — see [Configuring it](#configuring-it).
 
 <!-- screenshot: ledger style — one ink pill top edge, mark+media left,
@@ -26,7 +26,7 @@ cargo run
 ```
 
 There is no `--bottom` flag anymore (Stage 14 replaced it — see
-[Configuring it](#configuring-it)): the panel reads `~/.config/saola/panel.kdl` at
+[Configuring it](#configuring-it)): the panel reads `~/.config/saola/panel.toml` at
 boot, and everything about its layout — style, edge, margin, height, module lists,
 mark, color overrides — comes from that file. Config changes apply **live**: the
 panel watches the file (inotify) and re-applies it on save — no restart needed. A
@@ -36,13 +36,13 @@ thing a running panel can't pick up is a config *directory* created after boot �
 creating `~/.config/saola/` itself needs one restart, after which edits are live.
 
 For quick manual testing without editing the config file, five CLI flags override
-whatever `panel.kdl` says for that one run only: `--ledger` / `--islands`,
+whatever `panel.toml` says for that one run only: `--ledger` / `--islands`,
 `--top` / `--bottom`, and `--config-dir <dir>` (also spelled `--config-dir=<dir>`) —
-the last reads `panel.kdl` from a different directory entirely, so you can iterate
+the last reads `panel.toml` from a different directory entirely, so you can iterate
 on a scratch config (`cargo run -- --config-dir /tmp/panel-test`) while your real
 session's panel keeps running against the default, with live-reload following the
 override. They exist purely as a development convenience (see
-`main.rs`/`config::CliOverrides`) — `panel.kdl` is the real interface.
+`main.rs`/`config::CliOverrides`) — `panel.toml` is the real interface.
 
 ### Installing on Arch
 
@@ -75,7 +75,7 @@ install, copy it to `~/.config/systemd/user/`, point `ExecStart` at your binary
 
 ## Configuring it
 
-`~/.config/saola/panel.kdl`. The directory resolves most-specific-first:
+`~/.config/saola/panel.toml`. The directory resolves most-specific-first:
 
 1. `--config-dir <dir>` (a per-run override, for testing)
 2. `$SAOLA_CONFIG_DIR` — the Saola desktop's own variable, for a session manager to
@@ -85,29 +85,59 @@ install, copy it to `~/.config/systemd/user/`, point `ExecStart` at your binary
 4. `~/.config/saola` (the spec's fallback for an unset `$XDG_CONFIG_HOME`)
 
 An env var set to the empty string counts as unset, per the XDG spec's own rule.
-Every knob is
-optional; [`examples/panel.kdl`](examples/panel.kdl) documents all of them at their
-built-in default (copying it unchanged into your config is a no-op) and is the
-authoritative reference — read it before editing your own copy.
+Every knob is optional. [`examples/panel.toml`](examples/panel.toml) documents every
+key at its built-in default. When you copy it into your config unchanged, nothing
+changes. Read it before you edit your own copy.
+
+If `panel.kdl` remains in the config directory and no `panel.toml` file exists, the
+panel ignores `panel.kdl`. It prints a one-line hint on stderr that tells you to
+migrate.
 
 The resilience contract, because a status bar must never fail to start over a config
 typo:
 
 | Situation | Result |
 |---|---|
-| No `panel.kdl` at all | Built-in defaults, silent |
-| File present, not valid KDL at all | One `eprintln!` naming the file + the parse error, then the **whole file** falls back to defaults |
+| No `panel.toml` at all | Built-in defaults, silent |
+| File present, not valid TOML | One `eprintln!` naming the file + the parse error, then the **whole file** falls back to defaults |
 | One knob's value is nonsense (bad `style`/`edge`/`mark` string, bad hex color) | A warning naming that knob; **only that field** defaults, the rest of the document still applies |
 | An unknown module name in a list | A warning naming it; **that entry** is dropped, the rest of the list loads |
-| A list block present but explicitly empty (`left { }`) | That region is really empty — distinct from the block being absent, which uses the region's default list |
+| A list present but explicitly empty (`left = []`) | That region is really empty — distinct from the key being absent, which uses the region's default list |
 
-Top-level knobs: `style` (`"ledger"` / `"islands"`), `edge` (`"top"` / `"bottom"`),
-`margin`, `height`, the `left { }` / `center { }` / `right { }` module lists, `mark`
-(`"builtin:horns"` / `"builtin:notch"` / `"file:<path>"` / `"none"`), and a `colors { }`
-block overriding `ink` / `paper` / `accent` as hex strings. See `examples/panel.kdl` for
-the full grammar and every default value.
+Top-level keys: `style` (`"ledger"` / `"islands"`), `edge` (`"top"` / `"bottom"`),
+`margin`, `height`, the `left` / `center` / `right` module-list arrays, `mark`
+(`"builtin:horns"` / `"builtin:notch"` / `"file:<path>"` / `"none"`), `launcher`,
+`claude-icon`, a `[window-title]` table (`max-chars`, `overflow`), and a `[colors]`
+table overriding `ink` / `paper` / `accent` as hex strings:
 
-**Known limitation**: `colors { }` only overrides `palette.{ink,paper,accent}` — the
+```toml
+style = "ledger"
+edge = "top"
+margin = 20
+height = 48
+
+left   = ["mark", "window-title"]
+center = ["clock", "niri-columns"]
+right  = ["mpris", "volume", "network", "bluetooth", "battery", "claude", "antigravity", "tray", "notifications"]
+
+mark = "builtin:horns"
+launcher = "fuzzel"
+claude-icon = "anthropic"
+
+[window-title]
+max-chars = 50
+overflow = "truncate"
+
+[colors]
+ink = "#0C0A00"
+paper = "#FFFFF0"
+accent = "#C67139"
+```
+
+See [`examples/panel.toml`](examples/panel.toml) for the full key set and every default
+value.
+
+**Known limitation**: `[colors]` only overrides `palette.{ink,paper,accent}` — the
 alpha-stepped text/fill roles (`on_ink.primary`/`secondary`/etc.) are not recomputed from
 a custom palette, so overriding `ink` moves the bar's background but not its text color.
 Fixing this properly is a `saola-theme` change (recomputing `OnSurface` from the actual
@@ -121,7 +151,7 @@ the question this should let you answer at a glance.
 
 | Module | Signal source | Notes |
 |---|---|---|
-| Mark | none (static glyph) | No signal source at all — its `Message` is an uninhabited enum. Which glyph draws comes from `panel.kdl`'s `mark` knob. |
+| Mark | none (static glyph) | No signal source at all — its `Message` is an uninhabited enum. Which glyph draws comes from `panel.toml`'s `mark` knob. |
 | Clock | 1-minute-aligned timer | The one deliberate exception to "signal, not poll" — CLAUDE.md names it explicitly as the panel's slowest permitted tick. |
 | Media (`mpris`) | MPRIS, session D-Bus (`org.mpris.MediaPlayer2.*`) | Tracks however many players come and go; picks the most-recently-active playing (else paused) one. |
 | niri columns | niri IPC (`$NIRI_SOCKET`, event-stream) | Not D-Bus — newline-delimited JSON over a Unix socket. Renders nothing without niri. |

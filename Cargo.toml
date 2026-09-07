@@ -124,15 +124,23 @@ serde_json = "1"
 # dependency graph, so these flags land on that one runtime rather than
 # building a private copy.
 tokio = { version = "1", features = ["net", "io-util", "time"] }
-# `panel.kdl` (Stage 14). `kdl` is the reference Rust implementation of the
-# KDL document language the style guide's `panel { }` config sketch uses.
-# `src/config.rs` walks the parsed document by hand (`get_arg`, `children`,
-# …) rather than deriving a `serde`-style deserializer — see that module's
-# doc comment for why (precise per-knob warnings, and explicit code reads
-# better for CLAUDE.md's teaching-note rule). Default features only (`span`
-# for diagnostics-friendly parse errors, `serde` unused here since we don't
-# deserialize `PanelConfig` itself through `kdl`'s serde support).
-kdl = "6.7.1"
+# `panel.toml` (Stage 14, moved off KDL on 2026-09-07). `src/config.rs`
+# walks the parsed `toml::Table` by hand (`get`, `as_str`, `as_array`, …)
+# rather than deriving a `serde`-style deserializer — see that module's doc
+# comment for why (precise per-knob warnings, and explicit code reads better
+# for CLAUDE.md's teaching-note rule). The format itself is the family
+# convention saola-capture set on 2026-08-08 and saola-files, saola-greeter
+# and saola-notifications follow: one config language across the desktop.
+# Pinned to the `0.9` line rather than the newer `1.x` deliberately —
+# saola-theme's own `saola-tokens` already depends on `toml = "0.9"` (it
+# parses the token files with it), so `toml` 0.9.12 and its whole support
+# cast (`toml_datetime`, `toml_parser`, `toml_writer`, `winnow`,
+# `serde_core`, `serde_spanned`) were already in `Cargo.lock` before this
+# line existed: matching that line adds **zero** net new crates instead of
+# compiling a second major version beside the first. Default features
+# (`parse`, `display`, `serde`, `std`); `serde` is how `Table`/`Value` get
+# their own `Deserialize` impls, not this crate deriving anything.
+toml = "0.9"
 # Stage 19: resolves a tray item's `IconName` (e.g. `"slack"`) to a real
 # icon file via the freedesktop icon-theme spec — the same lookup GTK/Qt
 # apps use to find their own icons on disk (theme directories under
@@ -147,7 +155,7 @@ kdl = "6.7.1"
 freedesktop-icons = "0.4.0"
 # Stage 20: `#[derive(Serialize, Deserialize)]` on the `com.canonical.dbusmenu`
 # wire type in `src/modules/tray/menu.rs`. serde was already in the tree
-# (`serde_json`, `kdl` and `niri-ipc` all pull it in, and zbus is built on it),
+# (`serde_json`, `toml` and `niri-ipc` all pull it in, and zbus is built on it),
 # but a derive macro can only be *named* by a direct dependency — the
 # alternative is `#[serde(crate = "zbus::zvariant::export::serde")]` on every
 # type, which is noise. No new code lands in the binary from this line.
@@ -170,7 +178,7 @@ udev = "0.9.3"
 # zbus all pull it in); like the `serde` line above, this adds a *name* rather
 # than new code in the binary.
 libc = "0.2"
-# Live-reload of `panel.kdl`: the kernel's file-change signal, so a config
+# Live-reload of `panel.toml`: the kernel's file-change signal, so a config
 # edit reaches the running panel without a restart (see `src/config_watch.rs`).
 # The safe binding over the raw inotify(7) syscalls — Linux-only, which this
 # panel already is (wlr-layer-shell, sysfs, udev). Chosen over the

@@ -122,7 +122,7 @@ pub enum Message {
 }
 
 /// Module state: the focused window's title as the bridge last reported it,
-/// plus the `panel.kdl` knobs that decide how it is capped.
+/// plus the `panel.toml` knobs that decide how it is capped.
 ///
 /// `Default` is the boot state (`None` — nothing focused yet, so nothing
 /// drawn), which is also where a session that isn't running under niri stays
@@ -140,7 +140,7 @@ pub enum Message {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WindowTitle {
     title: Option<String>,
-    /// The `panel.kdl` `window-title { }` block's knobs: resolved at boot
+    /// The `panel.toml` `[window-title]` block's knobs: resolved at boot
     /// ([`Self::new`]) and swapped in place on a live config reload
     /// ([`Self::set_config`]), same as every other config-fed module
     /// (`mark`, `claude`).
@@ -203,7 +203,7 @@ impl WindowTitle {
     ///
     /// `theme` is the freshly rebuilt one `main.rs`'s reload arm just built
     /// via `config::build_theme` — re-caching the motion values from it on
-    /// every reload costs nothing (`colors { }` overrides never touch
+    /// every reload costs nothing (`[colors]` overrides never touch
     /// `motion`, so the three values never actually change), and it means
     /// this module never has to assume that stays true.
     pub fn set_config(&mut self, config: WindowTitleConfig, theme: &Theme) {
@@ -371,7 +371,7 @@ impl WindowTitle {
     ///   title still arrives only over the niri bridge. The timer advances a
     ///   translation that is, by definition, a function of time.
     /// - It is **gated twice over.** The mode has to be opted into in
-    ///   `panel.kdl` (a stock desktop never reaches this branch at all), and
+    ///   `panel.toml` (a stock desktop never reaches this branch at all), and
     ///   even then the title on screen has to actually overflow. A title that
     ///   fits, a window that loses focus, a focused window with a blank title
     ///   — each closes [`Self::is_marqueeing`] and this drops straight back
@@ -430,7 +430,7 @@ fn truncate(title: &str, max_chars: usize) -> String {
     // A budget of one leaves room for the ellipsis alone; zero (which the
     // config parser rejects, but which a future caller could still pass)
     // leaves room for nothing. Both are defensive, not reachable from
-    // `panel.kdl`.
+    // `panel.toml`.
     if max_chars == 0 {
         return String::new();
     }
@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn tiny_limits_degrade_to_the_ellipsis_alone() {
         assert_eq!(truncate("abcdef", 1), "…");
-        // Not reachable from `panel.kdl` (the parser rejects a non-positive
+        // Not reachable from `panel.toml` (the parser rejects a non-positive
         // `max-chars`), but it must not panic or produce a stray ellipsis.
         assert_eq!(truncate("abcdef", 0), "");
     }
@@ -818,7 +818,7 @@ mod tests {
     /// `set_config` over rebuilding with `new`), restarts an in-flight
     /// marquee run when the knobs actually changed, and leaves the run
     /// alone when they didn't (a reload triggered by some *other* knob in
-    /// `panel.kdl`).
+    /// `panel.toml`).
     #[test]
     fn set_config_keeps_the_title_and_resets_the_sweep_only_on_change() {
         let mut module = showing(TitleOverflow::Marquee, 4, "a long overflowing title");

@@ -412,7 +412,7 @@ fn wait_readable(fd: RawFd) -> bool {
 /// make a two-backlight laptop pick a different device each time. Sorting
 /// costs nothing on a directory with one entry and makes the choice stable.
 /// (A machine with two real backlights and a preference between them would
-/// want a `panel.kdl` knob; nothing has asked for one, so this doesn't
+/// want a `panel.toml` knob; nothing has asked for one, so this doesn't
 /// speculatively build it.)
 fn first_backlight_device() -> Option<String> {
     let mut names: Vec<String> = std::fs::read_dir(BACKLIGHT_ROOT)

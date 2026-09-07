@@ -27,14 +27,14 @@
 //! This turned out to be that next module. `Message` is no longer empty:
 //! [`Message::Pressed`] fires when the glyph is clicked, and `Mark` now
 //! carries a second field (`launcher: Option<String>`, resolved from
-//! `panel.kdl`'s `launcher` directive — see `crate::config::read_launcher`)
+//! `panel.toml`'s `launcher` directive — see `crate::config::read_launcher`)
 //! alongside `source`. The doc comment above is left in place rather than
 //! rewritten away: it is the accurate history of *why* the empty-enum
 //! wiring shape existed in the first place, and this section is the
 //! predicted "next module" arriving.
 //!
 //! `view` only builds an `iced::widget::button` around the glyph when
-//! `launcher` is `Some(..)` (`launcher "none"` in `panel.kdl`, or a
+//! `launcher` is `Some(..)` (`launcher = "none"` in `panel.toml`, or a
 //! genuinely absent config, resolve to `None` — see `PanelConfig::launcher`'s
 //! doc comment for why absence itself still defaults to `Some("fuzzel")`,
 //! so `None` only ever means an explicit opt-out). This isn't just
@@ -69,8 +69,8 @@
 //!
 //! # Stage 14: the mark becomes configurable
 //!
-//! `mark "builtin:horns" | "builtin:notch" | "file:…" | "none"` in
-//! `panel.kdl` (see `crate::config::MarkSource`) picks which glyph this
+//! `mark = "builtin:horns" | "builtin:notch" | "file:…" | "none"` in
+//! `panel.toml` (see `crate::config::MarkSource`) picks which glyph this
 //! module draws — the state struct went from a zero-field unit struct to
 //! one field (`source`) to hold that choice. `BuiltinHorns`/`BuiltinNotch`
 //! still route through `crate::icons`' embedded-asset machinery exactly as
@@ -106,7 +106,7 @@ pub enum Message {
 }
 
 /// Mark module state: which glyph (if any) to draw, resolved at
-/// construction from `panel.kdl`'s `mark` directive
+/// construction from `panel.toml`'s `mark` directive
 /// (`crate::config::PanelConfig::mark`), plus which command (if any) a
 /// click on it should spawn, resolved from the `launcher` directive
 /// (`crate::config::PanelConfig::launcher`) — neither changes for the life
@@ -122,7 +122,7 @@ pub struct Mark {
     /// `std::process::Command` in `main.rs` (whitespace-split there, not
     /// here: parsing it early would just mean threading a `Vec<String>`
     /// through this struct for no benefit, since nothing else ever reads
-    /// it). `None` means `launcher "none"` — the glyph renders exactly as
+    /// it). `None` means `launcher = "none"` — the glyph renders exactly as
     /// it did before this module could be clicked at all.
     launcher: Option<String>,
 }
@@ -165,7 +165,7 @@ impl Mark {
     /// something this module can validate ahead of time.
     /// Whether this module would draw anything right now — the presence
     /// question `Panel::island_view` asks before spending an island pill on
-    /// a module. `mark "none"` in `panel.kdl` is the one absent case; every
+    /// a module. `mark = "none"` in `panel.toml` is the one absent case; every
     /// other source always draws.
     pub fn is_present(&self) -> bool {
         !matches!(self.source, MarkSource::None)
@@ -174,7 +174,7 @@ impl Mark {
     /// The configured launcher command, if any — `main.rs`'s
     /// `Message::Mark(Message::Pressed)` arm reads this to know what to
     /// spawn. `Some` exactly when `view` built a clickable button, `None`
-    /// exactly when `launcher "none"` was configured (see `Mark::launcher`'s
+    /// exactly when `launcher = "none"` was configured (see `Mark::launcher`'s
     /// field doc comment) — the two always agree, since both read this same
     /// field.
     pub fn launcher(&self) -> Option<&str> {
@@ -202,7 +202,7 @@ impl Mark {
                 .height(size)
                 .style(move |_theme, _status| svg::Style { color: Some(color) })
                 .into(),
-            // `mark "none"`: the left region simply has one fewer widget.
+            // `mark = "none"`: the left region simply has one fewer widget.
             // An early return of a zero-sized `Space` (rather than falling
             // through to the button wrapping below) matters more now that
             // the button has a real footprint: wrapping "nothing" in a
@@ -217,7 +217,7 @@ impl Mark {
         // the module doc comment's "The mark becomes clickable" section),
         // so building one here for the `None` case would visibly dim the
         // glyph even though there is nothing for it to do. Skipping the
-        // button entirely keeps `launcher "none"` pixel-identical to the
+        // button entirely keeps `launcher = "none"` pixel-identical to the
         // mark's pre-clickable rendering.
         //
         // Both styles use `style::button::bare`, which keeps the button

@@ -42,7 +42,7 @@ package() {
   install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm644 contrib/systemd/saola-panel.service \
     "$pkgdir/usr/lib/systemd/user/saola-panel.service"
-  install -Dm644 examples/panel.kdl "$pkgdir/usr/share/doc/$pkgname/panel.kdl"
+  install -Dm644 examples/panel.toml "$pkgdir/usr/share/doc/$pkgname/panel.toml"
   install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
   install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
 }

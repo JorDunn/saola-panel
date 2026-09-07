@@ -6,7 +6,7 @@
 //! `sizes.panel_margin_ledger_top` at the anchored edge, which is what lifts
 //! the bar clear of the screen and lets `style::container::bar_pill` round
 //! its ends at `radii.pill`. It anchors to the top edge by default (or the
-//! bottom edge with `panel.kdl`'s `edge "bottom"` — see "Stage 14" below),
+//! bottom edge with `panel.toml`'s `edge = "bottom"` — see "Stage 14" below),
 //! reserving an exclusive zone so tiled windows sit beside it. Stage 3 lays
 //! the bar out ledger-style — left / center
 //! (clock) / right — per the Architecture section of `PLAN.md`; Stages 4-5
@@ -42,10 +42,10 @@
 //! `--bottom` is gone. `main` now loads [`config::PanelConfig`] once, before
 //! the daemon even starts, and reads `edge`/`height` off it to build the
 //! same `Anchor`/`LayerShellSettings` this stage 13 built from a CLI flag —
-//! `edge "bottom"` in `panel.kdl` is the only way to flip the bar now (see
+//! `edge = "bottom"` in `panel.toml` is the only way to flip the bar now (see
 //! `config`'s module doc comment for the full resilience story: an absent
 //! or malformed config degrades to exactly today's hardcoded layout, never
-//! a crash). `colors { }` overrides are applied to the boot `Theme`'s
+//! a crash). `[colors]` overrides are applied to the boot `Theme`'s
 //! palette *before* that `Theme` is handed to iced at all, and the module
 //! lists (`left`/`center`/`right`) replace the hardcoded regions in
 //! `Panel::bar_view` via `Panel::module_view`'s name → view mapping.
@@ -58,7 +58,7 @@
 //!
 //! # Stage 15: two layouts, one seam
 //!
-//! `style "islands"` in `panel.kdl` swaps the single ledger bar for the
+//! `style = "islands"` in `panel.toml` swaps the single ledger bar for the
 //! spec's default panel style: **three** free-standing solid-ink pill
 //! clusters floating over the wallpaper — since 2026-08-01 all drawn on
 //! **one** full-width layer-shell surface, the islands strip, as stacked
@@ -156,10 +156,10 @@ fn main() -> iced_layershell::Result {
     // file → today's hardcoded layout, never a crash). Command-line flags
     // (`--ledger`/`--islands`, `--top`/`--bottom`, `--config-dir`) then
     // override the file — a testing convenience, so switching modes doesn't
-    // require editing `panel.kdl` (see `config::CliOverrides`). The flags
+    // require editing `panel.toml` (see `config::CliOverrides`). The flags
     // are parsed into a value of their own (rather than applied and
     // forgotten) because the config is no longer read exactly once:
-    // `config_watch` re-reads `panel.kdl` whenever it changes on disk, and
+    // `config_watch` re-reads `panel.toml` whenever it changes on disk, and
     // the reload arm in `Panel::update` needs the boot flags in hand to
     // keep them winning over the file on every reload, not just the first
     // read.
@@ -189,7 +189,7 @@ fn main() -> iced_layershell::Result {
     // A separate Theme instance just for the values `main` needs before the
     // application starts (bar height, default font) — `Panel` gets its own
     // clone below rather than a borrow, which keeps the `Panel::new` boot
-    // closure simple (see the `daemon(..)` call). `colors { }` overrides are
+    // closure simple (see the `daemon(..)` call). `[colors]` overrides are
     // applied here, via `config::build_theme` (built-in palette + overrides,
     // then `Theme::with_palette` re-derives the on-surface roles) — both
     // `main`'s own use of `theme` and the clone `Panel` gets afterward see
@@ -227,7 +227,7 @@ fn main() -> iced_layershell::Result {
     // handoff for the exact trait shapes), and a closure is what lets
     // `config`/`theme` (read from the environment/filesystem here in
     // `main`, where doing so is straightforward) reach `Panel::new` without
-    // `Panel` re-reading `panel.kdl` itself on every boot. `namespace`,
+    // `Panel` re-reading `panel.toml` itself on every boot. `namespace`,
     // `update`, `subscription` and every `Settings` field besides
     // `default_font` are unchanged from Stage 13.
     //
@@ -312,7 +312,7 @@ fn main() -> iced_layershell::Result {
 }
 
 /// The geometry of one layer-shell surface: everything the wlr-layer-shell
-/// protocol needs to place it, derived from tokens and `panel.kdl` alone.
+/// protocol needs to place it, derived from tokens and `panel.toml` alone.
 ///
 /// This exists because the same numbers are needed in two places that cannot
 /// share a code path: `main` fills an [`LayerShellSettings`] for the surface
@@ -425,7 +425,7 @@ impl SurfaceGeometry {
     ///
     /// The strip is read back from the panel's own [`SurfaceGeometry`]
     /// (via [`initial_role`]) rather than re-derived from tokens, so a
-    /// `height` knob in `panel.kdl` moves the popover with the panel, and
+    /// `height` knob in `panel.toml` moves the popover with the panel, and
     /// the gap is clamped at 0 so no configuration can make the popover
     /// climb back over its trigger.
     ///
@@ -443,7 +443,7 @@ impl SurfaceGeometry {
     /// (20) in both styles since the islands margins were matched to the
     /// ledger's — which lines the popover's right edge up with the end of
     /// the panel it hangs from. It also means a user who moves the panel
-    /// with `margin` in `panel.kdl` moves the popover with it. (If
+    /// with `margin` in `panel.toml` moves the popover with it. (If
     /// saola-theme ever grows a dedicated `popover_margin` token, this is
     /// the line to change.)
     fn of(role: SurfaceRole, config: &config::PanelConfig, theme: &Theme) -> Self {
@@ -516,7 +516,7 @@ impl SurfaceGeometry {
         // protocol speaks integer pixels. The casts below are the one place
         // a size token crosses that boundary. Teaching note: `as u32` /
         // `as i32` truncate, which is fine here — every value is a whole
-        // number by construction (a token default, or a KDL integer knob).
+        // number by construction (a token default, or a TOML integer knob).
         let (height, side_margin, edge_margin) = match role {
             SurfaceRole::Bar => (
                 config.height(theme),
@@ -531,7 +531,7 @@ impl SurfaceGeometry {
                 // `panel_bar` (48). `config.height` can't be used directly:
                 // it resolves an absent knob to `panel_bar` for *both*
                 // styles. Reading the `Option` here keeps an explicit
-                // `height 52` in `panel.kdl` working while defaulting to
+                // `height = 52` in `panel.toml` working while defaulting to
                 // the islands token.
                 config.height.unwrap_or(theme.sizes.panel_pill),
                 // Islands share the ledger bar's insets as of 2026-08-01
@@ -811,8 +811,8 @@ enum Message {
     /// Also one of the two variants `Panel::update` delegates wholesale to
     /// the module rather than destructuring itself (the other is
     /// `Antigravity` just below). Near the end of the right region, per the
-    /// style guide's module order (`right { volume; network; battery; claude;
-    /// antigravity; tray; ... }`).
+    /// style guide's module order
+    /// (`right = ["volume", "network", "battery", "claude", "antigravity", "tray", …]`).
     ClaudeCode(modules::claude::Message),
     /// Wraps `modules::antigravity::Message` — the same three-variant shape as
     /// `ClaudeCode` above (`Updated`, `UsageUpdated`, `Tick`), for Google's
@@ -842,8 +842,8 @@ enum Message {
     /// notification surface — popups and the centre stay
     /// `saola-notifications`' own layer-shell windows, which is why this
     /// carries no `PopoverKind` and no popover content module. Renders at the
-    /// trailing end of the right region, per the style guide's `panel { }`
-    /// sketch (`right { … tray; notifications }`).
+    /// trailing end of the right region, per the style guide's TOML sketch
+    /// (`right = […, "tray", "notifications"]`).
     Notifications(modules::notifications::Message),
     /// Wraps [`popover::Message`] — the panel's first *interaction* messages
     /// rather than snapshots from a signal source. Three producers: the
@@ -872,7 +872,7 @@ enum Message {
     /// off on the trigger click; handled by storing the result while that
     /// popover is still the open one.
     ClaudeUsage(popovers::claude_usage::Message),
-    /// Wraps [`config_watch::Message`] — `panel.kdl` changed on disk and the
+    /// Wraps [`config_watch::Message`] — `panel.toml` changed on disk and the
     /// watcher worker re-parsed it (inotify is the signal; see that module's
     /// doc comment for the watch-the-directory and debounce mechanics). The
     /// payload is the whole new [`config::PanelConfig`], parsed off the UI
@@ -919,9 +919,9 @@ enum Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceRole {
     /// The ledger bar: the floating ink pill that is the *whole* panel in
-    /// `style "ledger"`. Created by `Settings` at boot; never spawned.
+    /// `style = "ledger"`. Created by `Settings` at boot; never spawned.
     Bar,
-    /// The islands strip: the *whole* panel in `style "islands"` — all
+    /// The islands strip: the *whole* panel in `style = "islands"` — all
     /// three floating pill clusters drawn on one full-width surface (see
     /// `Panel::islands_view`). Created by `Settings` at boot; never
     /// spawned. This was `Island(IslandKind)` — one surface per cluster —
@@ -964,7 +964,7 @@ enum SurfaceRole {
 /// it rides in [`IslandKind::Right`] as its own pill — pulled out of the
 /// status cluster by `Panel::right_region_split` exactly as the tray and the
 /// two agent modules are, which is all the separation one glyph earns. A
-/// dedicated fourth island would need a `panel.kdl` list of its own to say
+/// dedicated fourth island would need a `panel.toml` list of its own to say
 /// what goes in it (see the naming note below), and one bell does not justify
 /// that plumbing. Nothing here forecloses it: it would arrive as one more
 /// variant on this enum plus one more layer in `Panel::islands_view` and an
@@ -972,7 +972,7 @@ enum SurfaceRole {
 ///
 /// The variants are named for **position, not payload**, because that is what
 /// the config actually configures: each one maps 1:1 onto one of
-/// `panel.kdl`'s `left` / `center` / `right` module lists (Stage 14), so the
+/// `panel.toml`'s `left` / `center` / `right` module lists (Stage 14), so the
 /// island grouping is whatever the user's config says and there is no second
 /// copy of the module lists anywhere in this file. A dedicated notifications
 /// island would come with its own list — which is the one piece of config
@@ -996,13 +996,13 @@ enum IslandKind {
 /// registry.
 struct Panel {
     /// The Saola theme — the single source of every color and size on the
-    /// bar. `main` applies `panel.kdl`'s `colors { }` overrides to a
+    /// bar. `main` applies `panel.toml`'s `[colors]` overrides to a
     /// `Theme::saola()` before this field is ever populated (see
     /// `config::ColorOverrides::apply`), so every color read from here
     /// already reflects the user's config; a live config reload rebuilds it
     /// the same way (see the `Message::Config` arm in [`Panel::update`]).
     theme: Theme,
-    /// The parsed `panel.kdl` config, loaded at boot (Stage 14) and swapped
+    /// The parsed `panel.toml` config, loaded at boot (Stage 14) and swapped
     /// wholesale by a live reload (the `Message::Config` arm). Read
     /// by `Panel::bar_view`/`Panel::module_view` for the module lists;
     /// `theme`/`edge`/`height`/`margin` were already consumed in
@@ -1017,12 +1017,12 @@ struct Panel {
     /// The command-line flags `main` parsed at boot, kept so a live config
     /// reload can re-apply them on top of the freshly read file — `cargo run
     /// -- --islands` must keep meaning Islands across every reload of a
-    /// `panel.kdl` that says `style "ledger"`, the same precedence the boot
+    /// `panel.toml` that says `style = "ledger"`, the same precedence the boot
     /// read had. (The flags themselves can't change mid-process: argv is
     /// fixed at exec time, so storing the parsed value is exact, not a
     /// cache that could go stale.)
     cli: config::CliOverrides,
-    /// Where `panel.kdl` lives, as `main` resolved it once at boot
+    /// Where `panel.toml` lives, as `main` resolved it once at boot
     /// (`config::PanelConfig::resolve_path`: `--config-dir` >
     /// `$SAOLA_CONFIG_DIR` > the XDG chain). Held only so
     /// [`Panel::subscription`] can hand it to the `config_watch` worker —
@@ -1037,7 +1037,7 @@ struct Panel {
     clock: Clock,
     /// The bar's mark: a static glyph (see `Mark`'s doc comment) whose
     /// *choice* of glyph — horns, notch, a user file, or none — comes from
-    /// `panel.kdl`'s `mark` directive, and whose click-to-launch command
+    /// `panel.toml`'s `mark` directive, and whose click-to-launch command
     /// comes from the `launcher` directive, both resolved once at
     /// construction time into `Mark::new(config.mark.clone(),
     /// config.launcher.clone())` below.
@@ -1055,23 +1055,23 @@ struct Panel {
     /// `Columns::default()` (an empty dash row → renders nothing, which is
     /// also what a non-niri session leaves it at forever). Sits beside the
     /// clock in the centre region, per the style guide's
-    /// `center { clock; niri-columns }`.
+    /// `center = ["clock", "niri-columns"]`.
     columns: Columns,
     /// The focused window's title, as the niri bridge last reported it;
     /// starts as "nothing focused yet" → renders nothing (and stays there
     /// forever outside a niri session). Sits in the left region immediately
-    /// right of the mark, per the style guide's `left { mark; window-title }`.
+    /// right of the mark, per the style guide's `left = ["mark", "window-title"]`.
     window_title: WindowTitle,
     /// The last "active MPRIS player" snapshot pushed by the media worker;
     /// starts as `Media::default()` (no player known yet → renders
     /// nothing). A status-cluster glyph as of 2026-08-01 (style guide §7):
     /// sits at the head of the right region's status cluster, per the
-    /// style guide's `right { mpris; volume; network; ... }`.
+    /// style guide's `right = ["mpris", "volume", "network", …]`.
     media: Media,
     /// The last default-sink volume snapshot pushed by the pulse worker
     /// thread; starts as `Volume::default()` (no sink known yet → renders
     /// nothing). First of the right region's pills, per the style guide's
-    /// module order (`right { volume; network; battery; ... }`).
+    /// module order (`right = ["volume", "network", "battery", …]`).
     volume: Volume,
     /// The last battery snapshot pushed by the UPower worker; starts as
     /// `Battery::default()` (no battery known yet → renders nothing).
@@ -1176,7 +1176,7 @@ struct Panel {
 impl Panel {
     /// Boot. `config`/`cli`/`theme` are threaded in from `main`'s closure
     /// (see the `daemon(move || Panel::new(..), ..)` call) rather than each
-    /// re-derived here, so `panel.kdl` is read exactly once per *boot* —
+    /// re-derived here, so `panel.toml` is read exactly once per *boot* —
     /// `main` already needed `config`/`theme` before this point to size the
     /// layer-shell surface, and re-parsing the file a second time here
     /// would risk observing a different config if it changed between the
@@ -1607,7 +1607,7 @@ impl Panel {
                 self.popovers.closed(id);
                 Task::none()
             }
-            // `panel.kdl` changed on disk: the watcher already read and
+            // `panel.toml` changed on disk: the watcher already read and
             // parsed it (see `config_watch`); this arm's job is to make the
             // running panel *match* the new config — the live counterpart of
             // everything `main` + `Panel::new` derived from the boot read.
@@ -1674,7 +1674,7 @@ impl Panel {
                 // whitespace-separated token is the program,
                 // everything after is its arguments verbatim. It cannot run
                 // `sh -c "…"` semantics (pipes, quoted arguments containing
-                // spaces, `$HOME` expansion, …); `panel.kdl`'s `launcher`
+                // spaces, `$HOME` expansion, …); `panel.toml`'s `launcher`
                 // directive is documented as a plain argv list for exactly
                 // this reason. Good enough for `"fuzzel"` or `"wofi --show
                 // drun"`; a user who needs a shell pipeline can always point
@@ -1762,7 +1762,7 @@ impl Panel {
         }
     }
 
-    /// Make the running panel match a freshly reloaded `panel.kdl` — the
+    /// Make the running panel match a freshly reloaded `panel.toml` — the
     /// live counterpart of everything `main` + [`Panel::new`] derived from
     /// the boot read, in the same order.
     ///
@@ -1802,7 +1802,7 @@ impl Panel {
     /// `self.theme`: `build_theme` starts from a fresh `Palette::default()`
     /// every time, so applying a new config's overrides onto the already-
     /// overridden palette could never *revert* a color the user deleted from
-    /// `colors { }`.
+    /// `[colors]`.
     ///
     /// CLI flags are re-applied first — `self.cli` outranks the file on
     /// every read, not just the boot one (see that field's doc comment).
@@ -2112,7 +2112,7 @@ impl Panel {
             // `Subscription::none()` in every default configuration: this one
             // is the opt-in marquee's animation timer (style guide §5), gated
             // exactly like `claude_code`'s breath below — it exists only while
-            // `overflow "marquee"` is configured *and* the title on screen
+            // `overflow = "marquee"` is configured *and* the title on screen
             // actually overflows. See `WindowTitle::subscription`.
             self.window_title.subscription().map(Message::WindowTitle),
             // Always `Subscription::none()` (see `Mark::subscription`'s doc
@@ -2155,7 +2155,7 @@ impl Panel {
             self.notifications
                 .subscription()
                 .map(Message::Notifications),
-            // `panel.kdl` live-reload. Not a module signal either — it feeds
+            // `panel.toml` live-reload. Not a module signal either — it feeds
             // the whole panel, not one field — but a signal all the same:
             // inotify pushes file-change events, so an untouched config
             // costs nothing (see `config_watch`'s doc comment, including
@@ -2332,8 +2332,8 @@ impl Panel {
     /// the notification daemon, which is emphatically not quick settings.
     ///
     /// The bell is the one group that sits to the *right* of the status
-    /// cluster rather than the left. That is the style guide's own
-    /// `panel { }` sketch (`right { … tray; notifications }`), and it puts
+    /// cluster rather than the left. That is the style guide's own TOML
+    /// sketch (`right = […, "tray", "notifications"]`), and it puts
     /// the bell directly above the screen corner where `saola-notifications`
     /// anchors its centre — the surface the click opens.
     ///
@@ -2649,7 +2649,7 @@ impl Panel {
         // notifications — the three agent/tray groups sit to the *left* of
         // the status cluster (Jordan, 2026-08-01, extended 2026-08-14) and
         // the bell to its *right* (2026-09-05, the style guide's own
-        // `panel { }` order), so the quick-settings trigger keeps the middle
+        // TOML order), so the quick-settings trigger keeps the middle
         // and the bell takes the trailing end above the centre's anchor.
         // Every standalone group is gated on presence, so an absent one costs
         // neither space nor a gap — a machine with no `agy` sessions and no
@@ -2750,7 +2750,7 @@ impl Panel {
         // to clear the semicircle at this inset with room to spare.
         // `config.height(t)`
         // rather than the `panel_bar` token so the inset tracks the real
-        // geometry when `panel.kdl` sets a custom `height` (the two agree
+        // geometry when `panel.toml` sets a custom `height` (the two agree
         // at the default). This is *not* `config.margin` any more: that
         // knob became the surface's inset from the screen edge (`main`),
         // not padding inside the bar.
@@ -2764,7 +2764,7 @@ impl Panel {
         .into()
     }
 
-    /// The whole of what `style "islands"` draws on its one surface: the
+    /// The whole of what `style = "islands"` draws on its one surface: the
     /// three clusters stacked as layers of a single full-width element.
     ///
     /// `stack!` rather than the ledger's five-element row on purpose: each
@@ -2864,7 +2864,7 @@ impl Panel {
         // same order. There is deliberately no second copy of the default
         // grouping here: `mark; mpris` / `clock; niri-columns` /
         // `volume; network; battery; claude` are `PanelConfig::default`'s
-        // lists (Stage 14) and a user's `panel.kdl` moves modules between
+        // lists (Stage 14) and a user's `panel.toml` moves modules between
         // islands exactly as it moves them between ledger regions.
         let (modules, align) = match kind {
             IslandKind::Left => (&self.config.left, Horizontal::Left),
@@ -2875,7 +2875,7 @@ impl Panel {
         // Only modules that would draw something get a pill. This replaces
         // the Stage 15 caveat about empty scrim blobs: the old single-pill
         // island could only check `modules.is_empty()` (the explicit
-        // `left { }` case) and had to hope non-empty lists drew *something*;
+        // `left = []` case) and had to hope non-empty lists drew *something*;
         // per-module pills force the honest question, and
         // `module_is_present` is its answer. An island whose every module
         // is absent draws nothing at all.
@@ -3124,7 +3124,7 @@ mod tests {
     }
 
     /// The default config + default theme, exactly what an unconfigured
-    /// `panel.kdl` boots into — the fixture every test in this module
+    /// `panel.toml` boots into — the fixture every test in this module
     /// builds a `Panel` from, so a config-parsing bug can't silently change
     /// what these surface-registry tests are exercising.
     fn test_panel() -> Panel {
@@ -3256,7 +3256,7 @@ mod tests {
         }
     }
 
-    /// The default `panel.kdl` (no file at all) must render the same three
+    /// The default `panel.toml` (no file at all) must render the same three
     /// regions the bar always has — proof that `Panel::region`/`bar_view`
     /// actually consult `self.config` rather than a leftover hardcoded
     /// list.
@@ -3281,7 +3281,7 @@ mod tests {
 
     // ---- Stage 15: the Islands layout -----------------------------------
 
-    /// `style "islands"` and nothing else — the config an islands session
+    /// `style = "islands"` and nothing else — the config an islands session
     /// actually boots from, since every other knob's default is shared with
     /// ledger style.
     fn islands_config() -> config::PanelConfig {
@@ -3397,7 +3397,7 @@ mod tests {
         }
     }
 
-    /// A config that asks for a title but no mark (`mark "none"`) still
+    /// A config that asks for a title but no mark (`mark = "none"`) still
     /// draws the title. Once a fallback (when the title rode inside the
     /// mark's pill and needed somewhere to go without one), now just the
     /// normal path — the title's island never depended on the mark's being
@@ -3417,8 +3417,8 @@ mod tests {
         let _: Element<'_, Message> = panel.island_view(IslandKind::Left);
     }
 
-    /// An island whose module list is explicitly empty (`left { }` in
-    /// `panel.kdl`) renders nothing rather than an empty scrim pill.
+    /// An island whose module list is explicitly empty (`left = []` in
+    /// `panel.toml`) renders nothing rather than an empty scrim pill.
     #[test]
     fn an_island_with_no_modules_renders_nothing() {
         let config = config::PanelConfig {
@@ -3536,7 +3536,7 @@ mod tests {
         assert!(!geometry.events_transparent);
     }
 
-    /// `edge "bottom"` flips which edge every surface anchors to and which
+    /// `edge = "bottom"` flips which edge every surface anchors to and which
     /// margin carries the inset — in both styles.
     #[test]
     fn the_bottom_edge_flips_anchors_and_margins_in_both_styles() {
@@ -3707,7 +3707,7 @@ mod tests {
         }
     }
 
-    /// An oversized `height` knob in `panel.kdl` can push the panel strip
+    /// An oversized `height` knob in `panel.toml` can push the panel strip
     /// past `popover_top`. The gap clamps at 0 — the popover degrades to
     /// touching the panel, never to climbing back over its trigger.
     #[test]
@@ -3728,7 +3728,7 @@ mod tests {
         assert_eq!(popover.margin.0, 0);
     }
 
-    /// `edge "bottom"` flips the popover with the panel: it hangs off the
+    /// `edge = "bottom"` flips the popover with the panel: it hangs off the
     /// bottom edge and grows upward.
     #[test]
     fn the_bottom_edge_flips_the_popover_too() {
@@ -4362,7 +4362,7 @@ mod tests {
         let _: Element<'_, Message> = panel.bar_view();
     }
 
-    /// A reloaded `colors { }` reaches the running theme — and one *removed*
+    /// A reloaded `[colors]` reaches the running theme — and one *removed*
     /// from the file reverts to the stock palette, which is why
     /// `reload_config` rebuilds from `Theme::saola()` rather than mutating
     /// the current palette (apply only writes `Some` fields).
@@ -4390,7 +4390,7 @@ mod tests {
 
     /// The boot CLI flags keep beating the file on every reload, exactly as
     /// they beat it at boot — a `--islands` session stays Islands however
-    /// often a `style "ledger"` config is re-saved.
+    /// often a `style = "ledger"` config is re-saved.
     #[test]
     fn a_reload_keeps_cli_overrides_winning_over_the_file() {
         let mut panel = Panel::new(

@@ -54,8 +54,8 @@ Jordan runs **iwd, not NetworkManager** — never write NetworkManager code.
 Phase 2 (stages 7–22 in PLAN.md) grows this into the full-spec panel: per-module
 message enums nested in the panel enum, SVG icon infra (Lucide, stroke 2.75), mark +
 MPRIS + volume + niri-columns + Claude Code + tray (full dbusmenu) modules,
-multi-window daemon architecture (`SurfaceRole` registry), KDL config
-(`~/.config/saola/panel.kdl`), Islands layout (three solid-ink islands; the
+multi-window daemon architecture (`SurfaceRole` registry), TOML config
+(`~/.config/saola/panel.toml`), Islands layout (three solid-ink islands; the
 notifications bell rides in the right island as its own standalone group, not a fourth
 island), and popover infrastructure (one open at a time) with quick settings.
 

@@ -1,4 +1,4 @@
-//! Live-reload for `panel.kdl`: watch the file on disk, and hand the panel a
+//! Live-reload for `panel.toml`: watch the file on disk, and hand the panel a
 //! freshly parsed [`PanelConfig`] whenever it changes — so a config edit
 //! reaches the running bar without a restart.
 //!
@@ -16,13 +16,13 @@
 //!
 //! An inotify watch follows an **inode**, not a path. Most editors save
 //! "atomically": write the new content to a temp file, then `rename(2)` it
-//! over `panel.kdl` — which replaces the inode, so a watch on the file itself
+//! over `panel.toml` — which replaces the inode, so a watch on the file itself
 //! goes quiet after the very first save. Watching the parent directory
 //! (`~/.config/saola/`) instead means every way the file can change arrives
 //! as a directory event carrying the file's *name* — `CLOSE_WRITE` for an
 //! in-place save, `MOVED_TO` for the atomic rename, `CREATE`/`DELETE` for the
 //! file appearing or going away — and the name filter below picks out the
-//! ones about `panel.kdl`.
+//! ones about `panel.toml`.
 //!
 //! # Debounce
 //!
@@ -43,7 +43,7 @@
 //! is off, and the worker parks forever — the panel runs exactly as before
 //! this module existed. (Creating the directory and the file later needs a
 //! restart to pick up: watching the directory's *parent* for it to appear
-//! is more machinery than the case is worth. A `panel.kdl` *edited* into
+//! is more machinery than the case is worth. A `panel.toml` *edited* into
 //! an existing directory is the case this module serves, and that one
 //! works from the first save.) What the reload does with a malformed file
 //! is [`PanelConfig::reload_from`]'s contract: keep the running config,
@@ -75,7 +75,7 @@ pub enum Message {
     Reloaded(PanelConfig),
 }
 
-/// The watcher as an iced subscription, for the `panel.kdl` path `main`
+/// The watcher as an iced subscription, for the `panel.toml` path `main`
 /// resolved at boot (`PanelConfig::resolve_path` — the `--config-dir` /
 /// `$SAOLA_CONFIG_DIR` / XDG chain). Taking the *resolved* path rather than
 /// re-deriving it here is what guarantees the watcher and the boot loader
@@ -116,7 +116,7 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 fn watch_stream(path: &PathBuf) -> impl Stream<Item = Message> {
     let path = path.clone();
     iced::stream::channel(4, async move |mut sender: mpsc::Sender<Message>| {
-        // The path always has a parent (`…/panel.kdl` under some resolved
+        // The path always has a parent (`…/panel.toml` under some resolved
         // directory, by `PanelConfig::resolve_path`'s construction), but
         // destructure rather than unwrap — a defensive posture this worker
         // can afford, since "no watch" is a legal outcome. Park (rather
@@ -133,7 +133,7 @@ fn watch_stream(path: &PathBuf) -> impl Stream<Item = Message> {
 
         // The four ways the file's content can change under its name, per
         // the module doc comment: in-place save, atomic-rename save, created
-        // fresh, deleted. `MOVED_FROM` covers `mv panel.kdl elsewhere`,
+        // fresh, deleted. `MOVED_FROM` covers `mv panel.toml elsewhere`,
         // which is a deletion from this directory's point of view. The two
         // `_SELF` marks are about the watched *directory* itself going away
         // — without them the kernel would still drop the watch (delivering
@@ -200,7 +200,7 @@ fn watch_stream(path: &PathBuf) -> impl Stream<Item = Message> {
                 return;
             }
             // Directory events name the child they concern; skip everything
-            // that isn't about panel.kdl (the temp files of an atomic save,
+            // that isn't about panel.toml (the temp files of an atomic save,
             // sibling configs, …).
             if event.name.as_deref() != Some(file_name.as_os_str()) {
                 continue;
