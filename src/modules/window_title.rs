@@ -56,6 +56,23 @@
 //! Like `modules::claude`'s breath, the loop is **gated**: the timer exists
 //! only while marquee mode is configured *and* the title on screen actually
 //! overflows (see [`WindowTitle::subscription`]).
+//!
+//! # Where the timing numbers come from
+//!
+//! `saola-tokens` v0.8.0 (bundled from `saola-theme` v0.14.0) added
+//! `motion.marquee_dwell`, `motion.marquee_speed`, and `motion.frame`, so the
+//! two §5 numbers and the tick cadence are theme tokens now, not local
+//! constants — the module doc used to note that the theme had nothing to
+//! offer here; it does now. The wrinkle is that [`WindowTitle::subscription`]
+//! and the widget's draw path (see [`Marquee`]) have no `&Theme` to read
+//! from — the same problem `modules::claude`'s `breath_elapsed` doc comment
+//! names for the breath. The fix here is the same shape: [`WindowTitle`]
+//! caches the three values, converted to the units the animation math wants
+//! (`Duration` for the two durations, `f32` px/s for the rate), when the
+//! module is constructed ([`WindowTitle::new`]) or the theme is rebuilt on a
+//! config reload ([`WindowTitle::set_config`]) — both of which *do* have a
+//! `&Theme` in hand — and every other method reads the cached fields rather
+//! than reaching for the theme itself.
 
 use std::time::Duration;
 
@@ -80,40 +97,6 @@ use crate::config::{TitleOverflow, WindowTitleConfig};
 /// A literal `...` would eat three of the user's `max-chars` budget and read
 /// as punctuation rather than as elision.
 const ELLIPSIS: char = '…';
-
-/// How long the marquee rests at each end of its travel — style guide §5
-/// ("dwell **2s** at the head", "dwell **2s** at the tail").
-///
-/// Why here rather than in saola-theme: the same precedent `modules::
-/// claude`'s `BREATH_TICK` set. The theme owns the *motion table's* published
-/// values only where a token exists for them (`motion.breathe`,
-/// `motion.breathe_min_opacity`); the marquee has no tokens in the pinned
-/// release, and the dependency is pinned to a tag that is not to be bumped
-/// for this (CLAUDE.md, "Conventions"). So the two §5 numbers live here as
-/// named constants citing the section they come from, exactly as the breath's
-/// frame budget does.
-const MARQUEE_DWELL: Duration = Duration::from_secs(2);
-
-/// The sweep rate in logical pixels per second — style guide §5 ("`24px/s
-/// linear` sweep"). Linear on purpose: the breath eases because a breath
-/// turns around, and this one travels. See [`MARQUEE_DWELL`] for why the
-/// constant lives in this file.
-const MARQUEE_SPEED: f32 = 24.0;
-
-/// How often the marquee is redrawn while it is sweeping.
-///
-/// A **frame budget, not a design token** — the same distinction (and the
-/// same reasoning) as `modules::claude`'s `BREATH_TICK`, which see. The
-/// number differs from the breath's 100 ms because the *kind* of motion
-/// differs: an opacity fade hides its own sampling (the eye reads the rate of
-/// a fade, not its steps), but translation does not — a 100 ms tick at
-/// [`MARQUEE_SPEED`] would jump the text 2.4 px at a time, which at this
-/// deliberately slow rate reads as stepping rather than sliding. 33 ms
-/// (~30 Hz) puts each step at 0.8 px, under the ~1 px threshold where
-/// quantized travel becomes visible, while still waking the runtime half as
-/// often as a 60 fps redraw would — and only ever while an overflowing title
-/// is on screen (see [`WindowTitle::subscription`]).
-const MARQUEE_TICK: Duration = Duration::from_millis(33);
 
 /// This module's own message type (the per-module refactor — see
 /// `modules::clock::Message` for the full teaching note). `main.rs` nests it
@@ -144,7 +127,17 @@ pub enum Message {
 /// `Default` is the boot state (`None` — nothing focused yet, so nothing
 /// drawn), which is also where a session that isn't running under niri stays
 /// forever.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Eq` is dropped from the derive here (every other field still supports
+/// it) because `marquee_speed` is an `f32` — floats aren't `Eq`, only
+/// `PartialEq`, and nothing in this crate ever needed to hash or
+/// exhaustively-compare a whole `WindowTitle`.
+// `Default` exists only so `new` can spell `..Self::default()`: a bare
+// `WindowTitle::default()` leaves the cached motion values below at zero,
+// and a zero `frame_tick` handed to `iced::time::every` would spin the
+// runtime. Always construct through [`WindowTitle::new`], which fills them
+// from the theme.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct WindowTitle {
     title: Option<String>,
     /// The `panel.kdl` `window-title { }` block's knobs: resolved at boot
@@ -168,17 +161,32 @@ pub struct WindowTitle {
     /// the travel distance it is measured against only exists once the
     /// renderer has measured the text (see [`Marquee`]).
     sweep_elapsed: Duration,
+    /// `motion.marquee_dwell`, converted from the token's milliseconds to a
+    /// `Duration` once, at the point where a `&Theme` is in hand — see the
+    /// module doc comment's "Where the timing numbers come from". Read by
+    /// [`Self::view`] (by way of [`Marquee`]) instead of the theme itself.
+    marquee_dwell: Duration,
+    /// `motion.marquee_speed`, in logical pixels per second — already the
+    /// unit [`offset_at`] wants, so no conversion beyond the copy.
+    marquee_speed: f32,
+    /// `motion.frame`, converted to a `Duration` for [`iced::time::every`].
+    /// This is the value [`Self::subscription`] exists to read: it is the
+    /// one method here with no `&Theme` argument anywhere in its call chain.
+    frame_tick: Duration,
 }
 
 impl WindowTitle {
     /// Boot state for the configured knobs. Called from `Panel::new` with
-    /// `config.window_title`, the same "config picks, module renders" split
-    /// `Mark::new`/`ClaudeCode::new` already use.
-    pub fn new(config: WindowTitleConfig) -> Self {
+    /// `config.window_title` and the theme built at boot, the same
+    /// "config picks, module renders" split `Mark::new`/`ClaudeCode::new`
+    /// already use — `theme` is only read here for the three motion values
+    /// above ([`Self::cache_motion`]).
+    pub fn new(config: WindowTitleConfig, theme: &Theme) -> Self {
         Self {
             config,
             ..Self::default()
         }
+        .with_motion(theme)
     }
 
     /// Swap in freshly reloaded knobs, keeping the title that's on screen —
@@ -192,12 +200,36 @@ impl WindowTitle {
     /// the new geometry would show the title from some arbitrary middle
     /// position. The `!=` guard keeps the no-op reload (some *other* knob
     /// changed) from resetting a sweep for no reason.
-    pub fn set_config(&mut self, config: WindowTitleConfig) {
+    ///
+    /// `theme` is the freshly rebuilt one `main.rs`'s reload arm just built
+    /// via `config::build_theme` — re-caching the motion values from it on
+    /// every reload costs nothing (`colors { }` overrides never touch
+    /// `motion`, so the three values never actually change), and it means
+    /// this module never has to assume that stays true.
+    pub fn set_config(&mut self, config: WindowTitleConfig, theme: &Theme) {
         if config != self.config {
             self.config = config;
             self.sweep_epoch = None;
             self.sweep_elapsed = Duration::ZERO;
         }
+        self.cache_motion(theme);
+    }
+
+    /// Resolves the three motion tokens from `theme` into this module's own
+    /// units and stores them — the one place that reads `theme.motion` in
+    /// this file, called from both [`Self::new`] and [`Self::set_config`].
+    fn cache_motion(&mut self, theme: &Theme) {
+        self.marquee_dwell = Duration::from_millis(u64::from(theme.motion.marquee_dwell));
+        self.marquee_speed = theme.motion.marquee_speed;
+        self.frame_tick = Duration::from_millis(u64::from(theme.motion.frame));
+    }
+
+    /// Builder-style wrapper around [`Self::cache_motion`] for [`Self::new`],
+    /// which constructs its value with struct-update syntax before there is
+    /// a `&mut self` to call a setter on.
+    fn with_motion(mut self, theme: &Theme) -> Self {
+        self.cache_motion(theme);
+        self
     }
 
     /// Folds one message into the state. `main.rs` unwraps only the outer
@@ -308,6 +340,8 @@ impl WindowTitle {
                 size,
                 color,
                 elapsed: self.sweep_elapsed,
+                dwell: self.marquee_dwell,
+                speed: self.marquee_speed,
             });
         }
 
@@ -345,12 +379,14 @@ impl WindowTitle {
     ///
     /// Teaching note (subscription identity): iced recomputes
     /// `Panel::subscription` after every message and diffs the result.
-    /// `iced::time::every` keys on its `Duration` — a constant here — so an
-    /// unrelated message never restarts the timer mid-sweep; it is created
-    /// when the gate opens and torn down when it closes, which is exactly the
-    /// lifecycle wanted. The `Instant` the ticks carry is the runtime's, so a
-    /// torn-down-and-recreated timer still can't rewind the animation: the
-    /// epoch is re-established from the next tick.
+    /// `iced::time::every` keys on its `Duration` — [`Self::frame_tick`],
+    /// cached from `motion.frame` and effectively constant for the process's
+    /// whole lifetime (see [`Self::cache_motion`]) — so an unrelated message
+    /// never restarts the timer mid-sweep; it is created when the gate opens
+    /// and torn down when it closes, which is exactly the lifecycle wanted.
+    /// The `Instant` the ticks carry is the runtime's, so a torn-down-and-
+    /// recreated timer still can't rewind the animation: the epoch is
+    /// re-established from the next tick.
     ///
     /// Frames (`window::frames()`) would be the other tick source; the
     /// interval timer is used because `claude.rs` set that precedent and
@@ -361,7 +397,7 @@ impl WindowTitle {
             return Subscription::none();
         }
 
-        iced::time::every(MARQUEE_TICK).map(Message::Tick)
+        iced::time::every(self.frame_tick).map(Message::Tick)
     }
 }
 
@@ -423,9 +459,12 @@ fn truncate(title: &str, max_chars: usize) -> String {
 /// loop stops the moment the focused title fits" fall out of the arithmetic
 /// rather than needing a special case at the call site.
 ///
-/// The cycle is `dwell + sweep + dwell + sweep`, where `sweep =
-/// overflow_px / 24 px/s`, so a longer title takes proportionally longer to
-/// cross — 24 px/s is a *rate*, not a duration.
+/// The cycle is `dwell + sweep + dwell + sweep`, where `sweep = overflow_px /
+/// speed` — `speed` is `motion.marquee_speed` (style guide §5's `24px/s`
+/// default), a *rate*, not a duration, so a longer title takes proportionally
+/// longer to cross. `dwell` is `motion.marquee_dwell`, converted to a
+/// `Duration` by the caller ([`WindowTitle::cache_motion`]) since both ends
+/// of the ping-pong rest for the same length of time.
 ///
 /// Teaching note (why `f64` inside): the modulo below is what keeps a title
 /// that has been sweeping for an hour in the same step as one that started a
@@ -435,7 +474,7 @@ fn truncate(title: &str, max_chars: usize) -> String {
 /// `phase_of` solves the same problem with an integer-millisecond modulo; it
 /// can, because its cycle length is an integer number of milliseconds, and
 /// this one's is a division by a pixel rate.
-fn phase_at(elapsed: Duration, overflow_px: f32) -> Phase {
+fn phase_at(elapsed: Duration, overflow_px: f32, dwell: Duration, speed: f32) -> Phase {
     // The `is_finite` guard is for a degenerate measurement (a NaN width):
     // NaN fails every comparison, so without it the machine would fall
     // through to the sweep arms and propagate NaN into an offset. Parking is
@@ -444,8 +483,8 @@ fn phase_at(elapsed: Duration, overflow_px: f32) -> Phase {
         return Phase::DwellHead;
     }
 
-    let sweep = f64::from(overflow_px) / f64::from(MARQUEE_SPEED);
-    let dwell = MARQUEE_DWELL.as_secs_f64();
+    let sweep = f64::from(overflow_px) / f64::from(speed);
+    let dwell = dwell.as_secs_f64();
     let cycle = 2.0 * (dwell + sweep);
     let at = elapsed.as_secs_f64() % cycle;
 
@@ -470,8 +509,8 @@ fn phase_at(elapsed: Duration, overflow_px: f32) -> Phase {
 /// This is the only number [`Marquee::draw`] takes from the animation, and
 /// the only thing the state machine is *for*: the sweep is a translation and
 /// nothing else (style guide §5 — no fade, no scale, no colour change).
-fn offset_at(elapsed: Duration, overflow_px: f32) -> f32 {
-    match phase_at(elapsed, overflow_px) {
+fn offset_at(elapsed: Duration, overflow_px: f32, dwell: Duration, speed: f32) -> f32 {
+    match phase_at(elapsed, overflow_px, dwell, speed) {
         Phase::DwellHead => 0.0,
         Phase::SweepLeft { progress } => overflow_px * progress,
         Phase::DwellTail => overflow_px,
@@ -554,6 +593,12 @@ struct Marquee<'a> {
     /// sweep_elapsed`]); turned into pixels by [`offset_at`] in `draw`, once
     /// the travel distance is known.
     elapsed: Duration,
+    /// `motion.marquee_dwell`, already resolved to a `Duration` by
+    /// [`WindowTitle::cache_motion`] — same reasoning as `size` and `color`:
+    /// this widget never sees a `saola_theme::Theme` to read it from itself.
+    dwell: Duration,
+    /// `motion.marquee_speed`, in logical pixels per second.
+    speed: f32,
 }
 
 /// The widget's tree state: the renderer's laid-out copy of the title.
@@ -666,7 +711,7 @@ where
         // is always the *current* overflow, including the frame in which the
         // title changed length.
         let overflow = (state.paragraph.min_bounds().width - bounds.width).max(0.0);
-        let offset = offset_at(self.elapsed, overflow);
+        let offset = offset_at(self.elapsed, overflow, self.dwell, self.speed);
 
         renderer.fill_paragraph(
             state.paragraph.raw(),
@@ -680,6 +725,27 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stock theme, used everywhere a test needs *some* `&Theme` to
+    /// construct a module or call the timing math against. Reading
+    /// `motion.marquee_dwell`/`marquee_speed` off this (below) rather than
+    /// re-declaring the old literal constants is what these tests were
+    /// switched to do when the theme grew tokens for them — see the module
+    /// doc comment's "Where the timing numbers come from".
+    fn test_theme() -> Theme {
+        Theme::saola()
+    }
+
+    /// `motion.marquee_dwell`/`marquee_speed`, resolved once for the tests
+    /// below that call [`phase_at`]/[`offset_at`] directly (rather than
+    /// through a [`WindowTitle`], which caches them itself).
+    fn test_motion() -> (Duration, f32) {
+        let motion = test_theme().motion;
+        (
+            Duration::from_millis(u64::from(motion.marquee_dwell)),
+            motion.marquee_speed,
+        )
+    }
 
     #[test]
     fn a_title_within_the_limit_is_untouched() {
@@ -730,7 +796,7 @@ mod tests {
     /// draw, and the presence seam agrees with it.
     #[test]
     fn no_title_means_nothing_is_present() {
-        let module = WindowTitle::default();
+        let module = WindowTitle::new(WindowTitleConfig::default(), &test_theme());
         assert!(!module.is_present());
     }
 
@@ -738,7 +804,7 @@ mod tests {
     /// way state ever changes.
     #[test]
     fn an_updated_title_becomes_present() {
-        let mut module = WindowTitle::new(WindowTitleConfig::default());
+        let mut module = WindowTitle::new(WindowTitleConfig::default(), &test_theme());
         module.update(Message::Updated(Some("Alacritty".to_owned())));
         assert!(module.is_present());
         assert_eq!(module.title.as_deref(), Some("Alacritty"));
@@ -760,17 +826,23 @@ mod tests {
         assert!(module.sweep_epoch.is_some(), "the run is under way");
 
         // The same knobs again — an unrelated reload — must not reset it.
-        module.set_config(WindowTitleConfig {
-            max_chars: 4,
-            overflow: TitleOverflow::Marquee,
-        });
+        module.set_config(
+            WindowTitleConfig {
+                max_chars: 4,
+                overflow: TitleOverflow::Marquee,
+            },
+            &test_theme(),
+        );
         assert!(module.sweep_epoch.is_some());
 
         // Changed knobs restart the run from its head dwell…
-        module.set_config(WindowTitleConfig {
-            max_chars: 8,
-            overflow: TitleOverflow::Marquee,
-        });
+        module.set_config(
+            WindowTitleConfig {
+                max_chars: 8,
+                overflow: TitleOverflow::Marquee,
+            },
+            &test_theme(),
+        );
         assert_eq!(module.sweep_epoch, None);
         assert_eq!(module.sweep_elapsed, Duration::ZERO);
         // …and the title survives the swap.
@@ -782,10 +854,13 @@ mod tests {
 
     /// A module in one of the two overflow modes, showing `title`.
     fn showing(overflow: TitleOverflow, max_chars: usize, title: &str) -> WindowTitle {
-        let mut module = WindowTitle::new(WindowTitleConfig {
-            max_chars,
-            overflow,
-        });
+        let mut module = WindowTitle::new(
+            WindowTitleConfig {
+                max_chars,
+                overflow,
+            },
+            &test_theme(),
+        );
         module.update(Message::Updated(Some(title.to_owned())));
         module
     }
@@ -831,119 +906,137 @@ mod tests {
 
     // -- the state machine -------------------------------------------------
 
-    /// 48 px of travel is exactly 2 s of sweep at the §5 rate, which makes
+    /// 48 px of travel is exactly 2 s of sweep at the §5 rate
+    /// (`motion.marquee_speed`, 24 px/s in the stock theme), which makes
     /// every boundary in the cycle a whole second: dwell 0–2, sweep 2–4,
     /// dwell 4–6, sweep back 6–8.
     const TRAVEL: f32 = 48.0;
 
     #[test]
     fn the_cycle_runs_head_sweep_tail_sweep_and_repeats() {
+        let (dwell, speed) = test_motion();
+
         // Dwell at the head, parked at the start of the title.
-        assert_eq!(phase_at(at(0.0), TRAVEL), Phase::DwellHead);
-        assert_eq!(offset_at(at(0.0), TRAVEL), 0.0);
-        assert_eq!(phase_at(at(1.999), TRAVEL), Phase::DwellHead);
-        assert_eq!(offset_at(at(1.999), TRAVEL), 0.0);
+        assert_eq!(phase_at(at(0.0), TRAVEL, dwell, speed), Phase::DwellHead);
+        assert_eq!(offset_at(at(0.0), TRAVEL, dwell, speed), 0.0);
+        assert_eq!(phase_at(at(1.999), TRAVEL, dwell, speed), Phase::DwellHead);
+        assert_eq!(offset_at(at(1.999), TRAVEL, dwell, speed), 0.0);
 
         // Sweeping left, linearly: half the sweep is half the travel.
         assert_eq!(
-            phase_at(at(2.0), TRAVEL),
+            phase_at(at(2.0), TRAVEL, dwell, speed),
             Phase::SweepLeft { progress: 0.0 }
         );
-        assert_eq!(offset_at(at(2.0), TRAVEL), 0.0);
+        assert_eq!(offset_at(at(2.0), TRAVEL, dwell, speed), 0.0);
         assert_eq!(
-            phase_at(at(3.0), TRAVEL),
+            phase_at(at(3.0), TRAVEL, dwell, speed),
             Phase::SweepLeft { progress: 0.5 }
         );
-        assert_eq!(offset_at(at(3.0), TRAVEL), 24.0);
+        assert_eq!(offset_at(at(3.0), TRAVEL, dwell, speed), 24.0);
 
         // Dwell at the tail, with the end of the title fully visible.
-        assert_eq!(phase_at(at(4.0), TRAVEL), Phase::DwellTail);
-        assert_eq!(offset_at(at(4.0), TRAVEL), TRAVEL);
-        assert_eq!(phase_at(at(5.999), TRAVEL), Phase::DwellTail);
-        assert_eq!(offset_at(at(5.999), TRAVEL), TRAVEL);
+        assert_eq!(phase_at(at(4.0), TRAVEL, dwell, speed), Phase::DwellTail);
+        assert_eq!(offset_at(at(4.0), TRAVEL, dwell, speed), TRAVEL);
+        assert_eq!(phase_at(at(5.999), TRAVEL, dwell, speed), Phase::DwellTail);
+        assert_eq!(offset_at(at(5.999), TRAVEL, dwell, speed), TRAVEL);
 
         // Sweeping back the same way, at the same rate.
         assert_eq!(
-            phase_at(at(6.0), TRAVEL),
+            phase_at(at(6.0), TRAVEL, dwell, speed),
             Phase::SweepRight { progress: 0.0 }
         );
-        assert_eq!(offset_at(at(6.0), TRAVEL), TRAVEL);
+        assert_eq!(offset_at(at(6.0), TRAVEL, dwell, speed), TRAVEL);
         assert_eq!(
-            phase_at(at(7.0), TRAVEL),
+            phase_at(at(7.0), TRAVEL, dwell, speed),
             Phase::SweepRight { progress: 0.5 }
         );
-        assert_eq!(offset_at(at(7.0), TRAVEL), 24.0);
+        assert_eq!(offset_at(at(7.0), TRAVEL, dwell, speed), 24.0);
 
         // And straight back into the head dwell — the loop closes with no
         // pause of its own beyond the two specced ones.
-        assert_eq!(phase_at(at(8.0), TRAVEL), Phase::DwellHead);
-        assert_eq!(offset_at(at(8.0), TRAVEL), 0.0);
+        assert_eq!(phase_at(at(8.0), TRAVEL, dwell, speed), Phase::DwellHead);
+        assert_eq!(offset_at(at(8.0), TRAVEL, dwell, speed), 0.0);
         // A second lap is the first lap, exactly (and a hundredth is too —
         // the modulo happens in f64, so a long-focused window doesn't drift).
         assert_eq!(
-            phase_at(at(11.0), TRAVEL),
+            phase_at(at(11.0), TRAVEL, dwell, speed),
             Phase::SweepLeft { progress: 0.5 }
         );
-        assert_eq!(offset_at(at(803.0), TRAVEL), 24.0);
+        assert_eq!(offset_at(at(803.0), TRAVEL, dwell, speed), 24.0);
     }
 
     #[test]
     fn the_sweep_takes_its_time_from_the_distance_not_a_duration() {
+        let (dwell, speed) = test_motion();
+
         // 24 px/s is a rate: half the travel is half the sweep, so the whole
         // cycle is shorter for a title that only just overflows. 24 px = 1 s
         // each way, so this cycle is 6 s rather than 8.
-        assert_eq!(phase_at(at(2.5), 24.0), Phase::SweepLeft { progress: 0.5 });
-        assert_eq!(offset_at(at(2.5), 24.0), 12.0);
-        assert_eq!(phase_at(at(3.0), 24.0), Phase::DwellTail);
-        assert_eq!(phase_at(at(6.0), 24.0), Phase::DwellHead);
+        assert_eq!(
+            phase_at(at(2.5), 24.0, dwell, speed),
+            Phase::SweepLeft { progress: 0.5 }
+        );
+        assert_eq!(offset_at(at(2.5), 24.0, dwell, speed), 12.0);
+        assert_eq!(phase_at(at(3.0), 24.0, dwell, speed), Phase::DwellTail);
+        assert_eq!(phase_at(at(6.0), 24.0, dwell, speed), Phase::DwellHead);
 
         // A very long title takes proportionally longer to cross, and is
         // still dwelling at its head for exactly 2 s first.
-        assert_eq!(phase_at(at(1.9), 2400.0), Phase::DwellHead);
-        assert_eq!(offset_at(at(52.0), 2400.0), 1200.0);
+        assert_eq!(phase_at(at(1.9), 2400.0, dwell, speed), Phase::DwellHead);
+        assert_eq!(offset_at(at(52.0), 2400.0, dwell, speed), 1200.0);
     }
 
     #[test]
     fn the_offset_never_leaves_the_travel_and_the_sweeps_are_linear() {
+        let (dwell, speed) = test_motion();
+        // The frame cadence (`motion.frame`) the real subscription ticks at
+        // — used below only to pick a realistic sampling step, not because
+        // `offset_at` itself depends on it.
+        let frame_tick = Duration::from_millis(u64::from(test_theme().motion.frame));
+
         // Sampled at the real frame rate across two full cycles: the text is
         // never pulled past either end, and each sweep advances by the same
         // distance every frame (linear, per §5 — no easing anywhere).
         let mut previous = 0.0f32;
         let mut elapsed = Duration::ZERO;
         while elapsed < at(16.0) {
-            let offset = offset_at(elapsed, TRAVEL);
+            let offset = offset_at(elapsed, TRAVEL, dwell, speed);
             assert!(
                 (0.0..=TRAVEL).contains(&offset),
                 "offset left the travel at {elapsed:?}: {offset}"
             );
             // Nothing ever jumps more than a frame's worth of travel.
             assert!(
-                (offset - previous).abs() <= MARQUEE_SPEED * MARQUEE_TICK.as_secs_f32() + 1e-3,
+                (offset - previous).abs() <= speed * frame_tick.as_secs_f32() + 1e-3,
                 "offset jumped at {elapsed:?}: {previous} → {offset}"
             );
             previous = offset;
-            elapsed += MARQUEE_TICK;
+            elapsed += frame_tick;
         }
 
         // Linearity, stated directly: equal time steps inside one sweep cover
         // equal ground (the breath's cosine ease is the *other* animation).
-        let first = offset_at(at(2.5), TRAVEL) - offset_at(at(2.0), TRAVEL);
-        let second = offset_at(at(3.0), TRAVEL) - offset_at(at(2.5), TRAVEL);
+        let first =
+            offset_at(at(2.5), TRAVEL, dwell, speed) - offset_at(at(2.0), TRAVEL, dwell, speed);
+        let second =
+            offset_at(at(3.0), TRAVEL, dwell, speed) - offset_at(at(2.5), TRAVEL, dwell, speed);
         assert!((first - second).abs() < 1e-4, "{first} vs {second}");
     }
 
     #[test]
     fn nothing_moves_when_there_is_nothing_to_reveal() {
+        let (dwell, speed) = test_motion();
+
         // A title that fits has no travel, so the machine parks at the head
         // for all time rather than sweeping zero pixels back and forth.
         for seconds in [0.0, 2.0, 4.5, 900.0] {
-            assert_eq!(phase_at(at(seconds), 0.0), Phase::DwellHead);
-            assert_eq!(offset_at(at(seconds), 0.0), 0.0);
+            assert_eq!(phase_at(at(seconds), 0.0, dwell, speed), Phase::DwellHead);
+            assert_eq!(offset_at(at(seconds), 0.0, dwell, speed), 0.0);
             // Negative travel (a window wider than its text) is the same
             // case, and a degenerate measurement must not produce a NaN
             // offset either.
-            assert_eq!(offset_at(at(seconds), -12.0), 0.0);
-            assert_eq!(offset_at(at(seconds), f32::NAN), 0.0);
+            assert_eq!(offset_at(at(seconds), -12.0, dwell, speed), 0.0);
+            assert_eq!(offset_at(at(seconds), f32::NAN, dwell, speed), 0.0);
         }
     }
 
@@ -1030,7 +1123,15 @@ mod tests {
         module.update(Message::Updated(Some("a different long title".to_owned())));
         assert_eq!(module.sweep_epoch, None);
         assert_eq!(module.sweep_elapsed, Duration::ZERO);
-        assert_eq!(offset_at(module.sweep_elapsed, TRAVEL), 0.0);
+        assert_eq!(
+            offset_at(
+                module.sweep_elapsed,
+                TRAVEL,
+                module.marquee_dwell,
+                module.marquee_speed
+            ),
+            0.0
+        );
 
         // The next run establishes its own epoch from its own first tick.
         let restart = start + at(60.0);

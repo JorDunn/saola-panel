@@ -1197,7 +1197,7 @@ impl Panel {
             launcher_child: None,
             clock: Clock,
             columns: Columns::default(),
-            window_title: WindowTitle::new(config.window_title),
+            window_title: WindowTitle::new(config.window_title, &theme),
             media: Media::default(),
             volume: Volume::default(),
             battery: Battery::default(),
@@ -1820,7 +1820,8 @@ impl Panel {
         let theme = config::build_theme(&new_config.colors);
 
         self.mark = Mark::new(new_config.mark.clone(), new_config.launcher.clone());
-        self.window_title.set_config(new_config.window_title);
+        self.window_title
+            .set_config(new_config.window_title, &theme);
         self.claude_code.set_icon(new_config.claude_icon);
 
         let old_role = initial_role(&self.config);
