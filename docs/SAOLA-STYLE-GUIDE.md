@@ -140,6 +140,27 @@ Two grounds, and the choice is not aesthetic:
 Both variants are specified for the file picker and the control kit. Ship ivory as the
 window default; ink is a user preference.
 
+### Controls inside an ink window (2026-08-13)
+
+The ground is only half the question — a control also has to know whether it is *shell
+chrome* or *window content*. On ink they diverge.
+
+In shell chrome a control at rest is a full-opacity ivory pill (§6, "Secondary"). That is
+right on the panel, where the pill is the whole object and there is nothing else in the
+region competing for the eye. Inside an **ink window** it is wrong: an ivory pill on a
+dark window ground reads louder than the one terracotta control beside it, and §11's
+"exactly one terracotta element, and it is the live one" stops being true — the eye lands
+on the resting Cancel, not the live Save.
+
+So in an ink window, a control at rest steps back into the ivory fill ladder — the
+`0.07–0.16` band, `fill` at rest, `fill_strong` hovered, `track` pressed — with an
+`on_ink.primary` label, and **never** a full-opacity ivory fill. Full-ivory rest pills are
+shell-chrome-only. Ivory-versus-terracotta still says off-versus-on, just at window
+volume.
+
+Ivory windows are unaffected: a control at rest there is already a translucent ink fill
+(`rgba(12,10,0,.08)`), so chrome and window content share one recipe on ivory.
+
 ### Scrims over the wallpaper
 
 The wallpaper is never changed between states, only revealed at different strengths.
@@ -255,6 +276,9 @@ Short, and only where it carries meaning.
 | Session status breath | `2.4s ease-in-out` loop, opacity `0.45 → 1 → 0.45` |
 | Window-title marquee (opt-in, off by default) | `24px/s linear` sweep, `2s` dwell at each end — see below |
 
+An animated surface redraws on `motion.frame` (32ms). Use this cadence for every
+animated shell surface. Do not pick a new redraw interval per surface.
+
 ### The session status breath
 
 The only looping animation in the shell proper. A `status-working` or `status-subagents`
@@ -312,8 +336,13 @@ Height 38–40px (46–48px in overlays), `border-radius: 999px`, horizontal pad
 |---|---|---|
 | Primary (the live action) | `#C67139` bg, `#FFFFF0` text | `#C67139` bg, `#FFFFF0` text |
 | Secondary | `#FFFFF0` bg, `#0C0A00` text | `rgba(12,10,0,.08)` bg, `#0C0A00` text |
+| Secondary **on ink, in a window** (2026-08-13) | `rgba(255,255,240,.12)` bg → `.16` hovered → `.16` pressed, `#FFFFF0` text | *(same as Secondary — ivory is one recipe)* |
 | Ghost | transparent, `#F6A06B` text | transparent, `#8C491A` text |
 | Disabled | `rgba(255,255,240,.10)` bg, `rgba(255,255,240,.35)` text | `rgba(12,10,0,.08)` bg, `rgba(12,10,0,.35)` text |
+
+The window row is §2's "Controls inside an ink window": full-opacity ivory is the shell's
+rest fill, not a window's. Hover and press land on the same `.16` step — the ivory ladder
+has no rung between them — so press is carried by the pointer, not a third colour.
 
 ### Bare-icon menu
 
@@ -345,8 +374,8 @@ and lightened metadata (`rgba(255,255,240,.75)`).
 ### Popover
 
 Opaque ink, `30px` radius, `box-shadow: 0 18px 48px rgba(12,10,0,.5)`, 20–22px padding.
-Anchored 72px from the screen top, 26px from the relevant edge. **Only one popover open
-at a time** — opening one closes the others.
+Anchored 72px from the screen top, 26px from the relevant edge (`sizes.shell_edge_gap`).
+**Only one popover open at a time** — opening one closes the others.
 
 Popovers grow **downward** from their trigger when the trigger is near the top of the
 screen, and must never overlap the control that opened them.
@@ -362,9 +391,25 @@ from an app already on screen replaces its card and resets the clock.
 
 ### Notification centre
 
-460px, anchored 72px from the top and 26px from the right, `max-height: calc(100% - 98px)`
-with the list scrolling. **It hugs its content and only reaches full height when there is
-enough to show.** Grouped by application, each group collapsible, with a count chip.
+460px, anchored 72px from the top and 26px from the right (`sizes.shell_edge_gap`),
+`max-height: calc(100% - 98px)` with the list scrolling. **It hugs its content and only
+reaches full height when there is enough to show.** Grouped by application, each group
+collapsible, with a count chip.
+
+The canonical vertical rhythm uses four tokens. `sizes.notification_centre_padding`
+sets the outer vertical padding. `sizes.notification_centre_group_gap` sets the gap
+between app groups. `sizes.notification_centre_card_gap` sets the gap inside a group,
+between its header and its cards and between the cards. `sizes.notification_centre_row`
+sets the height of one card or entry row. A second consumer of this shape — a panel
+indicator popover, or a settings preview — should use the same four tokens. This keeps
+the two surfaces in step. The header row holds the title and the do-not-disturb toggle.
+It is `sizes.hit_target_bar` tall; `widget::bar_row_container` is that band.
+
+The horizontal padding is not a centre token. It is `sizes.island_gap`, by derivation:
+the centre is `sizes.notification_centre_width` wide, a card is
+`sizes.notification_card_width` wide, and the difference is two island gaps. A token
+that pinned the number would drift if either width changed, so the recipe is stated
+here instead.
 
 ---
 
@@ -379,7 +424,7 @@ enough to show.** Grouped by application, each group collapsible, with a count c
 | Notification centre | Ink, right | Grouped, collapsible, DND toggle, media footer. |
 | Quick settings | Ink, right | Power profile selector, battery and Wi-Fi readouts, volume slider, media. Buttons: terracotta fill when active/selected, ivory at rest, per §1's one rule. |
 | Lock | Wallpaper | Clock, date, temperature centred, nothing else. Click reveals avatar → name → password. |
-| Greeter | Wallpaper | Identical to lock plus a user list and a session list as ivory pills below the field. |
+| Greeter | Wallpaper | Lock minus temperature, plus user tiles below the field (`selection_tile` + `avatar_lock`; a "Not listed?" tile is always present), and a top-right battery readout + power cluster (shutdown/reboot/suspend as bare icons, one shared label, two-step confirm). Session pills only when configured, and only when more than one session is installed. |
 | Power menu | Ink, centred | Bare icons, one shared label. |
 | Boot menu | Ink (optionally wallpaper at 78%) | Bare icons and text, terracotta on the active entry, progress rule as the countdown. |
 | Boot / shutdown splash | Ink | Mark and one indeterminate rule. Shutdown drops terracotta entirely. |
@@ -521,7 +566,9 @@ question that window should answer.
 
 1. Is it shell chrome (ink) or a window (ivory)?
 2. Is there exactly one terracotta element, and is it the live one?
-3. Is every control at rest ivory, and is its text the opposite of its fill?
+3. Is every control at rest ivory, and is its text the opposite of its fill? (Inside an
+   **ink window**, rest is the ivory *fill ladder* — `.12`/`.16` — not a full-opacity
+   ivory pill; see §2, 2026-08-13. Full ivory at rest is shell chrome only.)
 4. Is all bar text ≥13px Plex Sans 500, with tabular numerals on anything counting?
 5. Are the corners pills or ≥18px radii?
 6. Does the serif appear at most twice, and never inside the bar?

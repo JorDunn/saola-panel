@@ -62,7 +62,7 @@
 use iced::widget::{button, column, container, row, slider, text, toggler};
 use iced::{Element, Fill};
 use saola_theme::convert::ColorExt;
-use saola_theme::{style, Surface, Theme};
+use saola_theme::{style, Chrome, Surface, Theme};
 
 use crate::icons::{self, Icon};
 use crate::modules::battery::{self, Battery};
@@ -190,7 +190,15 @@ fn power_row<'a>(theme: &Theme, power: &Power) -> Element<'a, crate::Message> {
         .on_press(message)
         .width(Fill)
         .height(Fill)
-        .style(style::segmented::segment(theme, Surface::Ink, is_selected))
+        // `Chrome::Shell`: this popover is shell chrome (panel/popover), not
+        // a control inside an app window, so `Chrome::Window`'s translucent
+        // rest recipe never applies here.
+        .style(style::segmented::segment(
+            theme,
+            Surface::Ink,
+            Chrome::Shell,
+            is_selected,
+        ))
         .into()
     });
 
@@ -491,7 +499,9 @@ fn media_row<'a>(theme: &Theme, media: &Media) -> Element<'a, crate::Message> {
     let icon_color: iced::Color = theme.palette.ink.into_iced();
     let transport = move |icon: Icon, on_press: crate::Message| -> Element<'a, crate::Message> {
         button(icons::icon(icon, theme.sizes.icon_bar, icon_color))
-            .style(style::button::rest(theme, Surface::Ink))
+            // `Chrome::Shell`: the popover is shell chrome, never a control
+            // inside an app window, so `Chrome::Window` never applies here.
+            .style(style::button::rest(theme, Surface::Ink, Chrome::Shell))
             .padding(theme.sizes.pill_gap)
             .on_press(on_press)
             .into()

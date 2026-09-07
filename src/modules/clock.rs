@@ -37,7 +37,7 @@ use iced::widget::button::Status;
 use iced::widget::{button, text};
 use iced::{Center, Element, Fill, Subscription};
 use saola_theme::convert::ColorExt;
-use saola_theme::{style, Surface, Theme};
+use saola_theme::{style, Chrome, Surface, Theme};
 
 use crate::config::PanelStyle;
 
@@ -102,7 +102,11 @@ impl Clock {
     /// The pill height uses `sizes.panel_pill_clock` (32px), a compact token
     /// designed for smaller indicators inside the 48px bar.
     fn ledger_pill(&self, theme: &Theme, reading: String) -> Element<'_, Message> {
-        let pill = style::button::rest(theme, Surface::Ink);
+        // `Chrome::Shell` is hardcoded: the bar is shell chrome, not a
+        // control inside an app window, so `Chrome::Window` (which recedes
+        // rest into a translucent fill instead of a solid ivory pill) never
+        // applies here.
+        let pill = style::button::rest(theme, Surface::Ink, Chrome::Shell);
         button(
             text(reading)
                 .size(theme.typography.size.bar)

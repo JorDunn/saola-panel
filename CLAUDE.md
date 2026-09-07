@@ -99,7 +99,7 @@ island), and popover infrastructure (one open at a time) with quick settings.
 ## Conventions
 
 - The theme dependency is pinned to a release tag (currently
-  `tag = "saola-theme-v0.3.0"`, with a matching `version`).
+  `tag = "saola-theme-v0.15.0"`, with a matching `version`).
   Bumping it is a deliberate, reviewed change — never switch to `branch = "main"`.
 - Copy the established module pattern for new modules (read an existing one first).
   From stage 7 on, each module owns its `pub enum Message`, nested as a variant of the

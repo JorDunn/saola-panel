@@ -29,7 +29,30 @@ license = "MIT OR Apache-2.0"
 # the change this repo had been carrying a temporary `[patch]` for. That patch
 # is retired with this bump, same as the Stage 14.5 one before it, and the
 # repo builds standalone again (which the release-attached PKGBUILD requires).
-saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.5.0", version = "0.5.0" }
+#
+# Bumped v0.5.0 → v0.15.0 to catch this repo back up with the released theme.
+# Three things changed on this side of the bump. First, the `rest` recipes
+# now take a `Chrome` (`style::button::rest`/`style::segmented::segment` grew
+# a `Chrome` parameter distinguishing shell chrome from controls inside an
+# app window) — the panel always passes `Chrome::Shell`, since the bar and
+# its popovers are shell surfaces, never an app window. Second,
+# `Theme::with_palette` (added in v0.6.0), which re-derives the on-surface
+# roles from a custom palette instead of leaving them pinned to the built-in
+# ivory/ink — see `src/config.rs`'s `build_theme`. Third, the v0.8.0 tokens
+# bundle's `motion.frame`/`motion.marquee_dwell`/`motion.marquee_speed` give
+# the window-title marquee (style guide §5) published timing values, so
+# `src/modules/window_title.rs`'s local `MARQUEE_DWELL`/`MARQUEE_TICK`/speed
+# constants — which predate those tokens — are replaced with values read
+# from the theme. v0.14.0 itself is a breaking release ("bound the avatar
+# file read in `Avatar::resolve`"; alpha-aware notification chrome, rest-span
+# toast motion, faded pills) but touches none of `avatar`, `style::
+# notification`, `life_rule`, or `icon_tile` — nothing this crate uses — so
+# it reaches this repo as a version bump only, no code follows it beyond the
+# three items above. v0.15.0 (tagged the same day) is additive only — avatar
+# placeholder, `widget::bar_row_container`, two notification-centre tokens —
+# and adds nothing this crate calls; it is pinned so the docs/ style-guide
+# copy and the code point at the same release.
+saola-theme = { git = "https://github.com/JorDunn/saola-theme", tag = "saola-theme-v0.15.0", version = "0.15.0" }
 iced_layershell = "0.19"
 # `svg` pulls in `resvg` (via `iced_tiny_skia`) for rasterizing the Lucide
 # icon assets embedded in `src/icons.rs` — see that module for the tinting
